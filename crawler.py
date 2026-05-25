@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -13,8 +14,9 @@ from supabase import Client, create_client
 
 APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "apidojo/tweet-scraper")
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
-FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "10"))
+FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "5"))
 STATE_KEY = "last_processed_tweet_id"
+MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
 
 
 logging.basicConfig(
@@ -131,6 +133,21 @@ def normalize_tweet(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ),
         "author_followers": author.get("followers") if isinstance(author, dict) else None,
     }
+
+
+def should_run_market_window(now: Optional[datetime] = None) -> bool:
+    if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
+        return True
+
+    current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
+    hour = current.hour
+    minute = current.minute
+
+    if 6 <= hour < 20:
+        return True
+    if 20 <= hour < 24:
+        return minute in {0, 30}
+    return False
 
 
 def get_supabase() -> Client:
@@ -327,6 +344,10 @@ def main() -> int:
         supabase = get_supabase()
         if os.getenv("SELF_TEST_MODE", "").lower() in {"1", "true", "yes"}:
             run_self_test(supabase)
+            return 0
+
+        if not should_run_market_window():
+            logger.info("Outside market monitoring window; skipping Apify/OpenAI run.")
             return 0
 
         openai_client = OpenAI(
