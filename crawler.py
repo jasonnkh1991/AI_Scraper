@@ -289,6 +289,27 @@ def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
         raise
 
 
+def run_self_test(supabase: Client) -> None:
+    now = datetime.now(timezone.utc)
+    tweet = {
+        "tweet_id": f"self-test-{now.strftime('%Y%m%d%H%M%S')}",
+        "author_handle": "system_test",
+        "author_name": "AI Scraper Self Test",
+        "tweet_text": "Synthetic test record for Telegram, Supabase, and dashboard verification.",
+        "tweet_url": "https://github.com/jasonnkh1991/AI_Scraper/actions",
+        "tweet_created_at": now.isoformat(),
+    }
+    insight = {
+        "impact_score": 10,
+        "target_sectors": ["System Test"],
+        "summary_zh": "系統測試：如果你喺 Telegram、Supabase insights 同 Dashboard 都見到呢條訊息，代表三段鏈路已經打通。",
+        "trading_action": "無需交易；呢條係測試訊號，可以驗證後喺 Supabase 刪除。",
+    }
+    send_telegram_alert(tweet, insight)
+    insert_insight(supabase, tweet, insight)
+    logger.info("Self-test alert sent and inserted tweet_id=%s", tweet["tweet_id"])
+
+
 def insert_insight(supabase: Client, tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
     row = {
         "tweet_id": tweet["tweet_id"],
@@ -313,6 +334,10 @@ def insert_insight(supabase: Client, tweet: Dict[str, Any], insight: Dict[str, A
 def main() -> int:
     try:
         supabase = get_supabase()
+        if os.getenv("SELF_TEST_MODE", "").lower() in {"1", "true", "yes"}:
+            run_self_test(supabase)
+            return 0
+
         openai_client = OpenAI(
             api_key=require_env("OPENAI_API_KEY"),
             base_url=os.getenv("OPENAI_BASE_URL") or None,

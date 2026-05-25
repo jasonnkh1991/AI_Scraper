@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "*/15 * * * *"
   workflow_dispatch:
+    inputs:
+      self_test:
+        description: "Send a synthetic Telegram alert and insert a test insight"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: monitor-x-list
@@ -37,4 +43,5 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWITTER_LIST_URL: ${{ secrets.TWITTER_LIST_URL }}
+          SELF_TEST_MODE: ${{ inputs.self_test }}
         run: python crawler.py
