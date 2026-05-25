@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import os
@@ -239,17 +240,6 @@ def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
-def escape_markdown_v2(value: Any) -> str:
-    text = str(value)
-    for char in r"_*[]()~`>#+-=|{}.!\\":
-        text = text.replace(char, f"\\{char}")
-    return text
-
-
-def escape_markdown_v2_url(value: str) -> str:
-    return value.replace("\\", "\\\\").replace(")", "\\)")
-
-
 def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
     bot_token = require_env("TELEGRAM_BOT_TOKEN")
     chat_id = require_env("TELEGRAM_CHAT_ID")
@@ -257,19 +247,19 @@ def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
     score_emoji = "🔥🔥🔥" if score >= 9 else "🔥🔥"
     sectors = ", ".join(insight.get("target_sectors") or ["未分類"])
     message = f"""
-*{score_emoji} 市場高優先級警報*
+<b>{score_emoji} 市場高優先級警報</b>
 
-*來源：*@{escape_markdown_v2(tweet["author_handle"])} · {escape_markdown_v2(tweet["author_name"])}
-*Impact：*{score}/10
-*板塊：*{escape_markdown_v2(sectors)}
+<b>來源：</b>@{html.escape(tweet["author_handle"])} · {html.escape(tweet["author_name"])}
+<b>Impact：</b>{score}/10
+<b>板塊：</b>{html.escape(sectors)}
 
-*重點：*
-{escape_markdown_v2(insight["summary_zh"])}
+<b>重點：</b>
+{html.escape(insight["summary_zh"])}
 
-*交易觀察：*
-{escape_markdown_v2(insight["trading_action"])}
+<b>交易觀察：</b>
+{html.escape(insight["trading_action"])}
 
-[查看原 Tweet]({escape_markdown_v2_url(tweet["tweet_url"])})
+<a href="{html.escape(tweet["tweet_url"])}">查看原 Tweet</a>
 """.strip()
 
     try:
@@ -278,16 +268,17 @@ def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
             json={
                 "chat_id": chat_id,
                 "text": message,
-                "parse_mode": "MarkdownV2",
+                "parse_mode": "HTML",
                 "disable_web_page_preview": False,
             },
             timeout=20,
         )
+        if not response.ok:
+            logger.error("Telegram response: %s", response.text)
         response.raise_for_status()
     except Exception:
         logger.exception("Telegram alert failed for tweet_id=%s", tweet["tweet_id"])
         raise
-
 
 def run_self_test(supabase: Client) -> None:
     now = datetime.now(timezone.utc)
