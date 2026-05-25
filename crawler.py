@@ -313,7 +313,10 @@ def insert_insight(supabase: Client, tweet: Dict[str, Any], insight: Dict[str, A
 def main() -> int:
     try:
         supabase = get_supabase()
-        openai_client = OpenAI(api_key=require_env("OPENAI_API_KEY"))
+        openai_client = OpenAI(
+            api_key=require_env("OPENAI_API_KEY"),
+            base_url=os.getenv("OPENAI_BASE_URL") or None,
+        )
         last_processed_id = fetch_last_processed_tweet_id(supabase)
         raw_tweets = fetch_tweets_from_apify()
     except Exception:
