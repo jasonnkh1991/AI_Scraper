@@ -31,10 +31,10 @@ class MarketWindowTest(unittest.TestCase):
         self.assertTrue(should_run_market_window(ny_time(19, 45)))
 
     def test_runs_every_30_minutes_during_low_frequency_window(self) -> None:
-        self.assertTrue(should_run_market_window(ny_time(20, 0)))
-        self.assertFalse(should_run_market_window(ny_time(20, 15)))
-        self.assertTrue(should_run_market_window(ny_time(20, 30)))
-        self.assertFalse(should_run_market_window(ny_time(23, 45)))
+        self.assertTrue(should_run_market_window(ny_time(20, 7)))
+        self.assertFalse(should_run_market_window(ny_time(20, 22)))
+        self.assertTrue(should_run_market_window(ny_time(20, 37)))
+        self.assertFalse(should_run_market_window(ny_time(23, 52)))
 
     def test_stops_overnight(self) -> None:
         self.assertFalse(should_run_market_window(ny_time(0, 0)))

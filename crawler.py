@@ -146,7 +146,7 @@ def should_run_market_window(now: Optional[datetime] = None) -> bool:
     if 6 <= hour < 20:
         return True
     if 20 <= hour < 24:
-        return minute in {0, 30}
+        return minute in {7, 37}
     return False
 
 

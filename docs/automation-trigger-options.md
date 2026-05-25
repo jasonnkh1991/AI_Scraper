@@ -4,11 +4,11 @@ Current production trigger: GitHub Actions scheduled workflow.
 
 ## Current Setup
 
-- GitHub Actions wakes every 15 minutes with `cron: "*/15 * * * *"`.
+- GitHub Actions wakes every 15 minutes with `cron: "7,22,37,52 * * * *"` to avoid popular queue times.
 - `crawler.py` decides whether to actually call Apify/OpenAI using New York time.
 - Active windows:
   - NY 06:00-20:00: run every 15 minutes.
-  - NY 20:00-24:00: run only at minute 00 and 30.
+  - NY 20:00-24:00: run only at minute 07 and 37.
   - NY 00:00-06:00: skip without calling Apify/OpenAI.
 - `FETCH_LIMIT=5`.
 
