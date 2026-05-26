@@ -15,7 +15,6 @@ from supabase import Client, create_client
 APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "apidojo/tweet-scraper")
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "5"))
-APIFY_MAX_CHARGE_USD = os.getenv("APIFY_MAX_CHARGE_USD", "0.01")
 STATE_KEY = "last_processed_tweet_id"
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
 
@@ -199,7 +198,6 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
         f"?token={token}"
         f"&timeout={APIFY_TIMEOUT_SECONDS}"
         f"&maxItems={FETCH_LIMIT}"
-        f"&maxTotalChargeUsd={APIFY_MAX_CHARGE_USD}"
         f"&limit={FETCH_LIMIT}"
         f"&clean=true"
     )
@@ -211,11 +209,13 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
 
     try:
         response = requests.post(api_url, json=payload, timeout=APIFY_TIMEOUT_SECONDS + 30)
+        if not response.ok:
+            logger.error("Apify response: %s", response.text)
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, list):
             raise ValueError(f"Unexpected Apify response shape: {type(data).__name__}")
-        logger.info("Apify returned %s raw items with charge cap maxItems=%s maxTotalChargeUsd=%s", len(data), FETCH_LIMIT, APIFY_MAX_CHARGE_USD)
+        logger.info("Apify returned %s raw items with maxItems=%s", len(data), FETCH_LIMIT)
         if data:
             logger.info("Apify first item keys: %s", sorted(data[0].keys()))
         return data
