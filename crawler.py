@@ -16,6 +16,8 @@ APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "pzMmk1t7AZ8OKJhfU")
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "5"))
 STATE_KEY = "last_processed_tweet_id"
+PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
+MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
 DEFAULT_TWITTER_SEARCH_QUERY = (
     "(from:realDonaldTrump OR from:TrumpDailyPosts OR from:RNCResearch OR "
@@ -185,17 +187,60 @@ def get_supabase() -> Client:
     return create_client(require_env("SUPABASE_URL"), require_env("SUPABASE_KEY"))
 
 
+def fetch_state_value(supabase: Client, key: str) -> Optional[str]:
+    response = (
+        supabase.table("system_states")
+        .select("value")
+        .eq("key", key)
+        .limit(1)
+        .execute()
+    )
+    rows = response.data or []
+    return str(rows[0]["value"]) if rows else None
+
+
+def save_state_value(supabase: Client, key: str, value: str) -> None:
+    (
+        supabase.table("system_states")
+        .upsert(
+            {
+                "key": key,
+                "value": value,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="key",
+        )
+        .execute()
+    )
+
+
+def fetch_processed_tweet_ids(supabase: Client) -> set[str]:
+    try:
+        value = fetch_state_value(supabase, PROCESSED_TWEET_IDS_KEY)
+        if not value:
+            return set()
+        data = json.loads(value)
+        if not isinstance(data, list):
+            return set()
+        return {str(item) for item in data if item}
+    except Exception:
+        logger.exception("Failed to fetch processed tweet ids from Supabase")
+        raise
+
+
+def save_processed_tweet_ids(supabase: Client, tweet_ids: set[str]) -> None:
+    ordered = sorted(tweet_ids, key=tweet_id_to_int, reverse=True)[:MAX_TRACKED_TWEET_IDS]
+    try:
+        save_state_value(supabase, PROCESSED_TWEET_IDS_KEY, json.dumps(ordered))
+    except Exception:
+        logger.exception("Failed to save processed tweet ids to Supabase")
+        raise
+
+
 def fetch_last_processed_tweet_id(supabase: Client) -> int:
     try:
-        response = (
-            supabase.table("system_states")
-            .select("value")
-            .eq("key", STATE_KEY)
-            .limit(1)
-            .execute()
-        )
-        rows = response.data or []
-        return tweet_id_to_int(rows[0]["value"]) if rows else 0
+        value = fetch_state_value(supabase, STATE_KEY)
+        return tweet_id_to_int(value) if value else 0
     except Exception:
         logger.exception("Failed to fetch state from Supabase")
         raise
@@ -203,18 +248,7 @@ def fetch_last_processed_tweet_id(supabase: Client) -> int:
 
 def save_last_processed_tweet_id(supabase: Client, tweet_id: str) -> None:
     try:
-        (
-            supabase.table("system_states")
-            .upsert(
-                {
-                    "key": STATE_KEY,
-                    "value": tweet_id,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                },
-                on_conflict="key",
-            )
-            .execute()
-        )
+        save_state_value(supabase, STATE_KEY, tweet_id)
     except Exception:
         logger.exception("Failed to save state to Supabase")
         raise
@@ -398,6 +432,7 @@ def insert_insight(supabase: Client, tweet: Dict[str, Any], insight: Dict[str, A
 def main() -> int:
     try:
         supabase = get_supabase()
+        processed_tweet_ids = fetch_processed_tweet_ids(supabase)
         if os.getenv("SELF_TEST_MODE", "").lower() in {"1", "true", "yes"}:
             run_self_test(supabase)
             return 0
@@ -417,11 +452,22 @@ def main() -> int:
 
     tweets = [tweet for item in raw_tweets if (tweet := normalize_tweet(item))]
     logger.info("Normalized %s tweets from %s Apify items", len(tweets), len(raw_tweets))
+    for tweet in tweets:
+        logger.info(
+            "Fetched tweet id=%s author=%s created_at=%s",
+            tweet["tweet_id"],
+            tweet["author_handle"],
+            tweet.get("tweet_created_at"),
+        )
     tweets.sort(key=lambda tweet: tweet["tweet_id_int"])
-    new_tweets = [tweet for tweet in tweets if tweet["tweet_id_int"] > last_processed_id]
+    new_tweets = [tweet for tweet in tweets if tweet["tweet_id"] not in processed_tweet_ids]
 
     if not new_tweets:
-        logger.info("No new tweets. last_processed_tweet_id=%s", last_processed_id)
+        logger.info(
+            "No unseen tweets. last_processed_tweet_id=%s tracked_seen_ids=%s",
+            last_processed_id,
+            len(processed_tweet_ids),
+        )
         return 0
 
     logger.info("Processing %s new tweets", len(new_tweets))
@@ -442,6 +488,7 @@ def main() -> int:
             else:
                 logger.info("Skipped low-impact tweet_id=%s", tweet["tweet_id"])
             latest_processed_tweet_id = tweet["tweet_id"]
+            processed_tweet_ids.add(tweet["tweet_id"])
         except Exception:
             fully_processed = False
             logger.exception("Stopped before advancing state past tweet_id=%s", tweet["tweet_id"])
@@ -450,7 +497,13 @@ def main() -> int:
     if fully_processed:
         try:
             save_last_processed_tweet_id(supabase, latest_processed_tweet_id)
-            logger.info("Saved %s=%s", STATE_KEY, latest_processed_tweet_id)
+            save_processed_tweet_ids(supabase, processed_tweet_ids)
+            logger.info(
+                "Saved %s=%s and tracked_seen_ids=%s",
+                STATE_KEY,
+                latest_processed_tweet_id,
+                len(processed_tweet_ids),
+            )
         except Exception:
             return 1
     else:
