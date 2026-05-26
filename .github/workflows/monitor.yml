@@ -45,5 +45,6 @@ jobs:
           TWITTER_LIST_URL: ${{ secrets.TWITTER_LIST_URL }}
           SELF_TEST_MODE: ${{ inputs.self_test }}
           FETCH_LIMIT: 5
+          APIFY_MAX_CHARGE_USD: "0.01"
           MARKET_TIMEZONE: America/New_York
         run: python crawler.py

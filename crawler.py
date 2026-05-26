@@ -15,6 +15,7 @@ from supabase import Client, create_client
 APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "apidojo/tweet-scraper")
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "5"))
+APIFY_MAX_CHARGE_USD = os.getenv("APIFY_MAX_CHARGE_USD", "0.01")
 STATE_KEY = "last_processed_tweet_id"
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
 
@@ -195,7 +196,12 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
     actor_path = APIFY_ACTOR_ID.replace("/", "~")
     api_url = (
         f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items"
-        f"?token={token}&timeout={APIFY_TIMEOUT_SECONDS}"
+        f"?token={token}"
+        f"&timeout={APIFY_TIMEOUT_SECONDS}"
+        f"&maxItems={FETCH_LIMIT}"
+        f"&maxTotalChargeUsd={APIFY_MAX_CHARGE_USD}"
+        f"&limit={FETCH_LIMIT}"
+        f"&clean=true"
     )
     payload = {
         "startUrls": [list_url],
@@ -209,6 +215,9 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
         data = response.json()
         if not isinstance(data, list):
             raise ValueError(f"Unexpected Apify response shape: {type(data).__name__}")
+        logger.info("Apify returned %s raw items with charge cap maxItems=%s maxTotalChargeUsd=%s", len(data), FETCH_LIMIT, APIFY_MAX_CHARGE_USD)
+        if data:
+            logger.info("Apify first item keys: %s", sorted(data[0].keys()))
         return data
     except Exception:
         logger.exception("Failed to fetch tweets from Apify")
@@ -360,6 +369,7 @@ def main() -> int:
         return 1
 
     tweets = [tweet for item in raw_tweets if (tweet := normalize_tweet(item))]
+    logger.info("Normalized %s tweets from %s Apify items", len(tweets), len(raw_tweets))
     tweets.sort(key=lambda tweet: tweet["tweet_id_int"])
     new_tweets = [tweet for tweet in tweets if tweet["tweet_id_int"] > last_processed_id]
 
