@@ -44,6 +44,6 @@ jobs:
           TWITTER_SEARCH_QUERY: ${{ secrets.TWITTER_SEARCH_QUERY }}
           APIFY_ACTOR_ID: pzMmk1t7AZ8OKJhfU
           SELF_TEST_MODE: ${{ inputs.self_test }}
-          FETCH_LIMIT: 5
+          FETCH_LIMIT: 10
           MARKET_TIMEZONE: America/New_York
         run: python crawler.py
