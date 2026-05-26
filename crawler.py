@@ -375,10 +375,11 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
 
 def fetch_truth_posts_from_apify() -> List[Dict[str, Any]]:
     payload = {
-        "startUrls": [TRUTH_SOCIAL_URL],
+        "startUrls": [{"url": TRUTH_SOCIAL_URL}],
         "maxItems": TRUTH_SOCIAL_FETCH_LIMIT,
         "contentType": "posts",
-        "flattenOutput": False,
+        "includeMuted": True,
+        "flattenOutput": True,
         "monitoringMode": False,
         "maxConcurrency": 1,
         "minConcurrency": 1,
@@ -529,8 +530,13 @@ def main() -> int:
         )
         last_processed_id = fetch_last_processed_tweet_id(supabase)
         raw_tweets = fetch_tweets_from_apify()
-        raw_truth_posts = fetch_truth_posts_from_apify() if should_run_truth_social() else []
-        if TRUTH_SOCIAL_ENABLED and not raw_truth_posts:
+        raw_truth_posts: List[Dict[str, Any]] = []
+        if should_run_truth_social():
+            try:
+                raw_truth_posts = fetch_truth_posts_from_apify()
+            except Exception:
+                logger.exception("Truth Social fetch failed; continuing with X source only.")
+        elif TRUTH_SOCIAL_ENABLED:
             logger.info("Truth Social fetch skipped for this run.")
     except Exception:
         return 1

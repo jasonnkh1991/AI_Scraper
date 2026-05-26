@@ -48,6 +48,28 @@ class TruthSocialTest(unittest.TestCase):
         self.assertFalse(crawler.should_run_truth_social(ny_time(9, 22)))
         self.assertFalse(crawler.should_run_truth_social(ny_time(2, 7)))
 
+    def test_truth_social_payload_uses_actor_url_objects(self) -> None:
+        captured = {}
+
+        def fake_run_actor(actor_id, payload, limit):
+            captured["actor_id"] = actor_id
+            captured["payload"] = payload
+            captured["limit"] = limit
+            return []
+
+        original = crawler.run_apify_actor
+        try:
+            crawler.run_apify_actor = fake_run_actor
+            crawler.fetch_truth_posts_from_apify()
+        finally:
+            crawler.run_apify_actor = original
+
+        self.assertEqual(captured["actor_id"], crawler.TRUTH_SOCIAL_ACTOR_ID)
+        self.assertEqual(captured["limit"], crawler.TRUTH_SOCIAL_FETCH_LIMIT)
+        self.assertEqual(captured["payload"]["startUrls"], [{"url": crawler.TRUTH_SOCIAL_URL}])
+        self.assertTrue(captured["payload"]["flattenOutput"])
+        self.assertTrue(captured["payload"]["includeMuted"])
+
 
 if __name__ == "__main__":
     unittest.main()
