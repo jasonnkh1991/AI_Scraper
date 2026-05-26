@@ -319,6 +319,34 @@ def save_last_processed_tweet_id(supabase: Client, tweet_id: str) -> None:
         raise
 
 
+def extract_apify_run_id(response_text: str) -> Optional[str]:
+    try:
+        body = json.loads(response_text)
+        message = str(body.get("error", {}).get("message", ""))
+    except json.JSONDecodeError:
+        message = response_text
+
+    match = re.search(r"run ID:\s*([A-Za-z0-9_-]+)", message)
+    return match.group(1) if match else None
+
+
+def fetch_apify_run_log(run_id: str, token: str) -> Optional[str]:
+    try:
+        response = requests.get(
+            f"https://api.apify.com/v2/logs/{run_id}",
+            params={"token": token},
+            timeout=20,
+        )
+        if not response.ok:
+            logger.warning("Could not fetch Apify run log run_id=%s status=%s", run_id, response.status_code)
+            return None
+        lines = response.text.splitlines()
+        return "\n".join(lines[-80:])
+    except Exception:
+        logger.exception("Could not fetch Apify run log run_id=%s", run_id)
+        return None
+
+
 def build_apify_payload() -> Dict[str, Any]:
     if APIFY_ACTOR_ID == "pzMmk1t7AZ8OKJhfU" or "twitter-tweets-scraper" in APIFY_ACTOR_ID:
         query = os.getenv("TWITTER_SEARCH_QUERY", DEFAULT_TWITTER_SEARCH_QUERY).strip()
@@ -356,6 +384,11 @@ def run_apify_actor(actor_id: str, payload: Dict[str, Any], limit: int) -> List[
         response = requests.post(api_url, json=payload, timeout=APIFY_TIMEOUT_SECONDS + 30)
         if not response.ok:
             logger.error("Apify response: %s", response.text)
+            run_id = extract_apify_run_id(response.text)
+            if run_id:
+                log_tail = fetch_apify_run_log(run_id, token)
+                if log_tail:
+                    logger.error("Apify run log tail run_id=%s:\n%s", run_id, log_tail)
         response.raise_for_status()
         data = response.json()
         if not isinstance(data, list):
@@ -373,9 +406,23 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
     return run_apify_actor(APIFY_ACTOR_ID, build_apify_payload(), FETCH_LIMIT)
 
 
+def canonical_truth_social_url(value: str) -> str:
+    url = value.strip().rstrip("/")
+    url = url.replace("https://www.truthsocial.com/", "https://truthsocial.com/")
+    url = url.replace("http://www.truthsocial.com/", "https://truthsocial.com/")
+    url = url.replace("http://truthsocial.com/", "https://truthsocial.com/")
+
+    prefix = "https://truthsocial.com/"
+    if url.startswith(prefix):
+        path = url[len(prefix):]
+        if path and not path.startswith("@") and "/" not in path:
+            return f"{prefix}@{path}"
+    return url
+
+
 def fetch_truth_posts_from_apify() -> List[Dict[str, Any]]:
     payload = {
-        "startUrls": [{"url": TRUTH_SOCIAL_URL}],
+        "startUrls": [canonical_truth_social_url(TRUTH_SOCIAL_URL)],
         "maxItems": TRUTH_SOCIAL_FETCH_LIMIT,
         "contentType": "posts",
         "includeMuted": True,
@@ -383,7 +430,7 @@ def fetch_truth_posts_from_apify() -> List[Dict[str, Any]]:
         "monitoringMode": False,
         "maxConcurrency": 1,
         "minConcurrency": 1,
-        "maxRequestRetries": 3,
+        "maxRequestRetries": int(os.getenv("TRUTH_SOCIAL_MAX_RETRIES", "10")),
     }
     return run_apify_actor(TRUTH_SOCIAL_ACTOR_ID, payload, TRUTH_SOCIAL_FETCH_LIMIT)
 
