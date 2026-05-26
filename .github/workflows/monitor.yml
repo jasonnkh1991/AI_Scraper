@@ -45,5 +45,10 @@ jobs:
           APIFY_ACTOR_ID: pzMmk1t7AZ8OKJhfU
           SELF_TEST_MODE: ${{ inputs.self_test }}
           FETCH_LIMIT: 10
+          TRUTH_SOCIAL_ENABLED: "true"
+          TRUTH_SOCIAL_ACTOR_ID: IWIOv7oeNxfcjTnX5
+          TRUTH_SOCIAL_URL: https://www.truthsocial.com/realDonaldTrump/
+          TRUTH_SOCIAL_FETCH_LIMIT: 3
+          TRUTH_SOCIAL_RUN_MINUTES: 60
           MARKET_TIMEZONE: America/New_York
         run: python crawler.py

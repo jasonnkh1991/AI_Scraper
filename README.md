@@ -59,3 +59,20 @@ Recommended query:
 Set this in GitHub Secrets as `TWITTER_SEARCH_QUERY`.
 
 To return to the old X List URL mode, set `APIFY_ACTOR_ID=apidojo/tweet-scraper` in the workflow and keep `TWITTER_LIST_URL`.
+
+## Truth Social Monitoring
+
+The crawler also monitors Donald Trump's Truth Social profile through Apify actor `IWIOv7oeNxfcjTnX5`.
+
+Defaults:
+
+```text
+TRUTH_SOCIAL_ENABLED=true
+TRUTH_SOCIAL_URL=https://www.truthsocial.com/realDonaldTrump/
+TRUTH_SOCIAL_FETCH_LIMIT=3
+TRUTH_SOCIAL_RUN_MINUTES=60
+```
+
+Truth Social posts are normalized into the same insight pipeline with IDs like `truth-<post_id>` and author handle `truth:realDonaldTrump`.
+
+Cost note: this actor currently charges per actor start plus per result, so it is intentionally throttled to once per hour by default.

@@ -103,3 +103,13 @@ TWITTER_SEARCH_QUERY=(from:realDonaldTrump OR from:TrumpDailyPosts OR from:RNCRe
 ```
 
 This avoids X List URL scraping and should reduce Apify cost versus `apidojo/tweet-scraper`. The tradeoff is that the monitored account list must be maintained manually in the search query.
+
+## Truth Social Source
+
+Truth Social monitoring uses actor `IWIOv7oeNxfcjTnX5` against:
+
+```text
+https://www.truthsocial.com/realDonaldTrump/
+```
+
+It runs at most once per hour by default (`TRUTH_SOCIAL_RUN_MINUTES=60`) and fetches up to 3 posts. This is deliberate because the actor pricing includes an actor-start event plus per-result charges.

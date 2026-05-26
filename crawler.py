@@ -1,5 +1,6 @@
 import html
 import json
+import re
 import logging
 import os
 import sys
@@ -19,6 +20,11 @@ STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
+TRUTH_SOCIAL_ENABLED = os.getenv("TRUTH_SOCIAL_ENABLED", "true").lower() in {"1", "true", "yes"}
+TRUTH_SOCIAL_ACTOR_ID = os.getenv("TRUTH_SOCIAL_ACTOR_ID", "IWIOv7oeNxfcjTnX5")
+TRUTH_SOCIAL_URL = os.getenv("TRUTH_SOCIAL_URL", "https://www.truthsocial.com/realDonaldTrump/")
+TRUTH_SOCIAL_FETCH_LIMIT = int(os.getenv("TRUTH_SOCIAL_FETCH_LIMIT", "3"))
+TRUTH_SOCIAL_RUN_MINUTES = int(os.getenv("TRUTH_SOCIAL_RUN_MINUTES", "60"))
 DEFAULT_TWITTER_SEARCH_QUERY = (
     "(from:realDonaldTrump OR from:TrumpDailyPosts OR from:RNCResearch OR "
     "from:Acyn OR from:DeitaOne OR from:FinancialJuice OR "
@@ -79,6 +85,12 @@ def tweet_id_to_int(value: Optional[str]) -> int:
         return 0
     digits = "".join(ch for ch in str(value) if ch.isdigit())
     return int(digits) if digits else 0
+
+
+def strip_html(value: Any) -> str:
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    text = html.unescape(text)
+    return " ".join(text.split())
 
 
 def parse_datetime(value: Optional[str]) -> Optional[str]:
@@ -166,6 +178,59 @@ def normalize_tweet(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ),
         "author_followers": author.get("followers") if isinstance(author, dict) else None,
     }
+
+
+def normalize_truth_post(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    post_id = str(get_nested(item, "id", "post.id", "uri") or "")
+    content = get_nested(item, "content", "text", "full_text", "post.content")
+    text = strip_html(content)
+    if not post_id or not text:
+        return None
+
+    account = item.get("account") if isinstance(item.get("account"), dict) else {}
+    handle = (
+        get_nested(item, "account.username", "account.acct", "username", "acct")
+        or "realDonaldTrump"
+    )
+    handle = str(handle).lstrip("@")
+    author_name = (
+        get_nested(item, "account.display_name", "account.displayName", "displayName", "display_name")
+        or "Donald J. Trump"
+    )
+    created_at = parse_datetime(
+        get_nested(item, "created_at", "createdAt", "date", "timestamp")
+    )
+    url = (
+        get_nested(item, "url", "uri", "link")
+        or f"https://www.truthsocial.com/@{handle}/posts/{post_id}"
+    )
+
+    return {
+        "tweet_id": f"truth-{post_id}",
+        "tweet_id_int": tweet_id_to_int(post_id),
+        "author_handle": f"truth:{handle}",
+        "author_name": str(author_name),
+        "tweet_text": text,
+        "tweet_url": str(url),
+        "tweet_created_at": created_at,
+        "author_followers": account.get("followers_count") if isinstance(account, dict) else None,
+    }
+
+
+def should_run_truth_social(now: Optional[datetime] = None) -> bool:
+    if not TRUTH_SOCIAL_ENABLED:
+        return False
+    if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
+        return True
+
+    current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
+    if not should_run_market_window(current):
+        return False
+    if TRUTH_SOCIAL_RUN_MINUTES <= 15:
+        return True
+    if TRUTH_SOCIAL_RUN_MINUTES <= 30:
+        return current.minute in {7, 37}
+    return current.minute == 7
 
 
 def should_run_market_window(now: Optional[datetime] = None) -> bool:
@@ -274,19 +339,18 @@ def build_apify_payload() -> Dict[str, Any]:
     }
 
 
-def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
+def run_apify_actor(actor_id: str, payload: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
     token = require_env("APIFY_TOKEN")
-    actor_path = APIFY_ACTOR_ID.replace("/", "~")
+    actor_path = actor_id.replace("/", "~")
     api_url = (
         f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items"
         f"?token={token}"
         f"&timeout={APIFY_TIMEOUT_SECONDS}"
-        f"&maxItems={FETCH_LIMIT}"
-        f"&limit={FETCH_LIMIT}"
+        f"&maxItems={limit}"
+        f"&limit={limit}"
         f"&clean=true"
     )
-    payload = build_apify_payload()
-    logger.info("Running Apify actor=%s fetch_limit=%s payload_keys=%s", APIFY_ACTOR_ID, FETCH_LIMIT, sorted(payload.keys()))
+    logger.info("Running Apify actor=%s fetch_limit=%s payload_keys=%s", actor_id, limit, sorted(payload.keys()))
 
     try:
         response = requests.post(api_url, json=payload, timeout=APIFY_TIMEOUT_SECONDS + 30)
@@ -296,13 +360,31 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
         data = response.json()
         if not isinstance(data, list):
             raise ValueError(f"Unexpected Apify response shape: {type(data).__name__}")
-        logger.info("Apify returned %s raw items with maxItems=%s", len(data), FETCH_LIMIT)
+        logger.info("Apify actor=%s returned %s raw items with maxItems=%s", actor_id, len(data), limit)
         if data:
-            logger.info("Apify first item keys: %s", sorted(data[0].keys()))
+            logger.info("Apify actor=%s first item keys: %s", actor_id, sorted(data[0].keys()))
         return data
     except Exception:
-        logger.exception("Failed to fetch tweets from Apify")
+        logger.exception("Failed to fetch data from Apify actor=%s", actor_id)
         raise
+
+
+def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
+    return run_apify_actor(APIFY_ACTOR_ID, build_apify_payload(), FETCH_LIMIT)
+
+
+def fetch_truth_posts_from_apify() -> List[Dict[str, Any]]:
+    payload = {
+        "startUrls": [TRUTH_SOCIAL_URL],
+        "maxItems": TRUTH_SOCIAL_FETCH_LIMIT,
+        "contentType": "posts",
+        "flattenOutput": False,
+        "monitoringMode": False,
+        "maxConcurrency": 1,
+        "minConcurrency": 1,
+        "maxRequestRetries": 3,
+    }
+    return run_apify_actor(TRUTH_SOCIAL_ACTOR_ID, payload, TRUTH_SOCIAL_FETCH_LIMIT)
 
 
 def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
@@ -447,11 +529,21 @@ def main() -> int:
         )
         last_processed_id = fetch_last_processed_tweet_id(supabase)
         raw_tweets = fetch_tweets_from_apify()
+        raw_truth_posts = fetch_truth_posts_from_apify() if should_run_truth_social() else []
+        if TRUTH_SOCIAL_ENABLED and not raw_truth_posts:
+            logger.info("Truth Social fetch skipped for this run.")
     except Exception:
         return 1
 
     tweets = [tweet for item in raw_tweets if (tweet := normalize_tweet(item))]
-    logger.info("Normalized %s tweets from %s Apify items", len(tweets), len(raw_tweets))
+    truth_posts = [post for item in raw_truth_posts if (post := normalize_truth_post(item))]
+    tweets.extend(truth_posts)
+    logger.info(
+        "Normalized %s total items from %s X items and %s Truth Social items",
+        len(tweets),
+        len(raw_tweets),
+        len(raw_truth_posts),
+    )
     for tweet in tweets:
         logger.info(
             "Fetched tweet id=%s author=%s created_at=%s",
