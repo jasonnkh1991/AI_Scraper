@@ -12,11 +12,19 @@ from openai import OpenAI
 from supabase import Client, create_client
 
 
-APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "apidojo/tweet-scraper")
+APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "pzMmk1t7AZ8OKJhfU")
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "5"))
 STATE_KEY = "last_processed_tweet_id"
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
+DEFAULT_TWITTER_SEARCH_QUERY = (
+    "(from:realDonaldTrump OR from:TrumpDailyPosts OR from:RNCResearch OR "
+    "from:Acyn OR from:DeitaOne OR from:FinancialJuice OR "
+    "from:unusual_whales OR from:dylan522p OR from:IanCutress OR "
+    "from:tomshardware OR from:elonmusk OR from:samaltman OR "
+    "from:satyanadella OR from:sundarpichai OR from:POTUS) "
+    "-filter:replies lang:en"
+)
 
 
 logging.basicConfig(
@@ -98,26 +106,49 @@ def normalize_tweet(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     tweet_id = str(
         get_nested(item, "id", "tweet_id", "tweetId", "rest_id", "legacy.id_str") or ""
     )
-    text = get_nested(item, "text", "fullText", "full_text", "legacy.full_text")
+    text = get_nested(
+        item,
+        "text",
+        "fullText",
+        "full_text",
+        "legacy.full_text",
+        "content",
+        "tweet.text",
+        "tweet.full_text",
+    )
     if not tweet_id or not text:
         return None
 
     author = item.get("author") if isinstance(item.get("author"), dict) else {}
     handle = (
-        get_nested(item, "author.userName", "author.username", "author.screen_name")
+        get_nested(
+            item,
+            "author.userName",
+            "author.username",
+            "author.screen_name",
+            "author.handle",
+            "user.username",
+            "user.screen_name",
+            "user.handle",
+        )
         or item.get("username")
         or item.get("userName")
+        or item.get("screen_name")
+        or item.get("handle")
         or "unknown"
     )
     handle = str(handle).lstrip("@")
     author_name = (
-        get_nested(item, "author.name", "author.displayName")
+        get_nested(item, "author.name", "author.displayName", "user.name", "user.displayName")
         or item.get("authorName")
+        or item.get("name")
         or handle
     )
     tweet_url = (
         item.get("url")
         or item.get("twitterUrl")
+        or item.get("tweetUrl")
+        or item.get("link")
         or f"https://x.com/{handle}/status/{tweet_id}"
     )
 
@@ -129,7 +160,7 @@ def normalize_tweet(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "tweet_text": str(text),
         "tweet_url": str(tweet_url),
         "tweet_created_at": parse_datetime(
-            item.get("createdAt") or item.get("created_at") or item.get("date")
+            item.get("createdAt") or item.get("created_at") or item.get("date") or item.get("timestamp")
         ),
         "author_followers": author.get("followers") if isinstance(author, dict) else None,
     }
@@ -189,9 +220,28 @@ def save_last_processed_tweet_id(supabase: Client, tweet_id: str) -> None:
         raise
 
 
+def build_apify_payload() -> Dict[str, Any]:
+    if APIFY_ACTOR_ID == "pzMmk1t7AZ8OKJhfU" or "twitter-tweets-scraper" in APIFY_ACTOR_ID:
+        query = os.getenv("TWITTER_SEARCH_QUERY", DEFAULT_TWITTER_SEARCH_QUERY).strip()
+        if not query:
+            raise RuntimeError("Missing TWITTER_SEARCH_QUERY")
+        return {
+            "mode": "Advanced Search",
+            "query": query,
+            "query_type": "Latest",
+            "max_results": FETCH_LIMIT,
+        }
+
+    list_url = require_env("TWITTER_LIST_URL")
+    return {
+        "startUrls": [list_url],
+        "maxItems": FETCH_LIMIT,
+        "sort": "Latest",
+    }
+
+
 def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
     token = require_env("APIFY_TOKEN")
-    list_url = require_env("TWITTER_LIST_URL")
     actor_path = APIFY_ACTOR_ID.replace("/", "~")
     api_url = (
         f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items"
@@ -201,11 +251,8 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
         f"&limit={FETCH_LIMIT}"
         f"&clean=true"
     )
-    payload = {
-        "startUrls": [list_url],
-        "maxItems": FETCH_LIMIT,
-        "sort": "Latest",
-    }
+    payload = build_apify_payload()
+    logger.info("Running Apify actor=%s fetch_limit=%s payload_keys=%s", APIFY_ACTOR_ID, FETCH_LIMIT, sorted(payload.keys()))
 
     try:
         response = requests.post(api_url, json=payload, timeout=APIFY_TIMEOUT_SECONDS + 30)

@@ -93,3 +93,13 @@ Cons:
 Keep GitHub Actions for now. It is free, simple, works with the existing Python crawler, and keeps secrets out of the public repo.
 
 If GitHub schedule delay becomes unacceptable, the next best option is an external cron service calling a protected Vercel API route, or a self-hosted cron if a long-running machine is available.
+
+## Apify Cost Mode
+
+The crawler defaults to the lower-cost ScrapeBadger actor `pzMmk1t7AZ8OKJhfU`, using Advanced Search:
+
+```text
+TWITTER_SEARCH_QUERY=(from:realDonaldTrump OR from:TrumpDailyPosts OR from:RNCResearch OR from:Acyn OR from:DeitaOne OR from:FinancialJuice OR from:unusual_whales OR from:dylan522p OR from:IanCutress OR from:tomshardware OR from:elonmusk OR from:samaltman OR from:satyanadella OR from:sundarpichai OR from:POTUS) -filter:replies lang:en
+```
+
+This avoids X List URL scraping and should reduce Apify cost versus `apidojo/tweet-scraper`. The tradeoff is that the monitored account list must be maintained manually in the search query.

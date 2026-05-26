@@ -20,7 +20,8 @@ Add these repository secrets:
 - `OPENAI_MODEL`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
-- `TWITTER_LIST_URL`
+- `TWITTER_LIST_URL` optional for the old list actor
+- `TWITTER_SEARCH_QUERY` for the default low-cost ScrapeBadger actor
 
 ## 3. Vercel Environment Variables
 
@@ -44,3 +45,17 @@ python3 -m venv .venv
 pip install -r requirements.txt
 python crawler.py
 ```
+
+## Low-Cost Apify Mode
+
+The crawler now defaults to ScrapeBadger's `pzMmk1t7AZ8OKJhfU` actor, using Twitter Advanced Search instead of an X List URL.
+
+Recommended query:
+
+```text
+(from:realDonaldTrump OR from:TrumpDailyPosts OR from:RNCResearch OR from:Acyn OR from:DeitaOne OR from:FinancialJuice OR from:unusual_whales OR from:dylan522p OR from:IanCutress OR from:tomshardware OR from:elonmusk OR from:samaltman OR from:satyanadella OR from:sundarpichai OR from:POTUS) -filter:replies lang:en
+```
+
+Set this in GitHub Secrets as `TWITTER_SEARCH_QUERY`.
+
+To return to the old X List URL mode, set `APIFY_ACTOR_ID=apidojo/tweet-scraper` in the workflow and keep `TWITTER_LIST_URL`.
