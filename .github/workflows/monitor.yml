@@ -14,10 +14,15 @@ on:
         type: boolean
         default: false
       fetch_limit:
-        description: "X.com fetch limit"
+        description: "X.com fetch limit during NY 06:00-24:00"
         required: false
         type: string
         default: "10"
+      overnight_fetch_limit:
+        description: "X.com fetch limit during NY 00:00-06:00"
+        required: false
+        type: string
+        default: "5"
       truth_social_fetch_limit:
         description: "Truth Social fetch limit"
         required: false
@@ -75,6 +80,7 @@ jobs:
           APIFY_ACTOR_ID: pzMmk1t7AZ8OKJhfU
           SELF_TEST_MODE: ${{ inputs.self_test }}
           FETCH_LIMIT: ${{ inputs.fetch_limit || '10' }}
+          OVERNIGHT_FETCH_LIMIT: ${{ inputs.overnight_fetch_limit || '5' }}
           BYPASS_MARKET_WINDOW: ${{ inputs.bypass_market_window }}
           TRUTH_SOCIAL_ENABLED: "true"
           TRUTH_SOCIAL_ACTOR_ID: IWIOv7oeNxfcjTnX5

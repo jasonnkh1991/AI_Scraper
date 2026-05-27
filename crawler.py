@@ -16,6 +16,7 @@ from supabase import Client, create_client
 APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "pzMmk1t7AZ8OKJhfU")
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "5"))
+OVERNIGHT_FETCH_LIMIT = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "5"))
 STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
@@ -217,6 +218,17 @@ def normalize_truth_post(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def is_overnight_window(now: Optional[datetime] = None) -> bool:
+    current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
+    return 0 <= current.hour < 6
+
+
+def current_x_fetch_limit(now: Optional[datetime] = None) -> int:
+    if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
+        return FETCH_LIMIT
+    return OVERNIGHT_FETCH_LIMIT if is_overnight_window(now) else FETCH_LIMIT
+
+
 def should_run_truth_social(now: Optional[datetime] = None) -> bool:
     if not TRUTH_SOCIAL_ENABLED:
         return False
@@ -224,6 +236,8 @@ def should_run_truth_social(now: Optional[datetime] = None) -> bool:
         return True
 
     current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
+    if is_overnight_window(current):
+        return False
     if not should_run_market_window(current):
         return False
     if TRUTH_SOCIAL_RUN_MINUTES <= 15:
@@ -244,6 +258,8 @@ def should_run_market_window(now: Optional[datetime] = None) -> bool:
     if 6 <= hour < 20:
         return True
     if 20 <= hour < 24:
+        return minute in {7, 37}
+    if 0 <= hour < 6:
         return minute in {7, 37}
     return False
 
@@ -347,7 +363,8 @@ def fetch_apify_run_log(run_id: str, token: str) -> Optional[str]:
         return None
 
 
-def build_apify_payload() -> Dict[str, Any]:
+def build_apify_payload(fetch_limit: Optional[int] = None) -> Dict[str, Any]:
+    limit = fetch_limit if fetch_limit is not None else current_x_fetch_limit()
     if APIFY_ACTOR_ID == "pzMmk1t7AZ8OKJhfU" or "twitter-tweets-scraper" in APIFY_ACTOR_ID:
         query = os.getenv("TWITTER_SEARCH_QUERY", DEFAULT_TWITTER_SEARCH_QUERY).strip()
         if not query:
@@ -356,13 +373,13 @@ def build_apify_payload() -> Dict[str, Any]:
             "mode": "Advanced Search",
             "query": query,
             "query_type": "Latest",
-            "max_results": FETCH_LIMIT,
+            "max_results": limit,
         }
 
     list_url = require_env("TWITTER_LIST_URL")
     return {
         "startUrls": [list_url],
-        "maxItems": FETCH_LIMIT,
+        "maxItems": limit,
         "sort": "Latest",
     }
 
@@ -409,7 +426,9 @@ def run_apify_actor(actor_id: str, payload: Dict[str, Any], limit: int) -> List[
 
 
 def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
-    return run_apify_actor(APIFY_ACTOR_ID, build_apify_payload(), FETCH_LIMIT)
+    limit = current_x_fetch_limit()
+    logger.info("Using X fetch limit=%s", limit)
+    return run_apify_actor(APIFY_ACTOR_ID, build_apify_payload(limit), limit)
 
 
 def canonical_truth_social_url(value: str) -> str:
