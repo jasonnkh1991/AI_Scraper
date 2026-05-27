@@ -370,6 +370,10 @@ def build_apify_payload() -> Dict[str, Any]:
 def run_apify_actor(actor_id: str, payload: Dict[str, Any], limit: int) -> List[Dict[str, Any]]:
     token = require_env("APIFY_TOKEN")
     actor_path = actor_id.replace("/", "~")
+    max_total_charge_usd = os.getenv("APIFY_MAX_TOTAL_CHARGE_USD", "").strip()
+    if actor_id == TRUTH_SOCIAL_ACTOR_ID:
+        max_total_charge_usd = os.getenv("TRUTH_SOCIAL_MAX_TOTAL_CHARGE_USD", max_total_charge_usd or "0.02").strip()
+
     api_url = (
         f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items"
         f"?token={token}"
@@ -378,6 +382,8 @@ def run_apify_actor(actor_id: str, payload: Dict[str, Any], limit: int) -> List[
         f"&limit={limit}"
         f"&clean=true"
     )
+    if max_total_charge_usd:
+        api_url += f"&maxTotalChargeUsd={max_total_charge_usd}"
     logger.info("Running Apify actor=%s fetch_limit=%s payload_keys=%s", actor_id, limit, sorted(payload.keys()))
 
     try:

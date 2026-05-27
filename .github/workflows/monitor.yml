@@ -83,5 +83,6 @@ jobs:
           TRUTH_SOCIAL_RUN_MINUTES: ${{ inputs.truth_social_run_minutes || '60' }}
           TRUTH_SOCIAL_DIAGNOSTIC_MODE: ${{ inputs.truth_social_diagnostic_mode }}
           TRUTH_SOCIAL_DIAGNOSTIC_DATE: ${{ inputs.truth_social_diagnostic_date }}
+          TRUTH_SOCIAL_MAX_TOTAL_CHARGE_USD: "0.02"
           MARKET_TIMEZONE: America/New_York
         run: python crawler.py
