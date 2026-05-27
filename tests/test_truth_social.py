@@ -67,17 +67,18 @@ class TruthSocialTest(unittest.TestCase):
         self.assertEqual(captured["actor_id"], crawler.TRUTH_SOCIAL_ACTOR_ID)
         self.assertEqual(captured["limit"], crawler.TRUTH_SOCIAL_FETCH_LIMIT)
         self.assertEqual(captured["payload"]["startUrls"], [crawler.canonical_truth_social_url(crawler.TRUTH_SOCIAL_URL)])
-        self.assertTrue(captured["payload"]["flattenOutput"])
-        self.assertTrue(captured["payload"]["includeMuted"])
+        self.assertNotIn("contentType", captured["payload"])
+        self.assertNotIn("flattenOutput", captured["payload"])
+        self.assertNotIn("includeMuted", captured["payload"])
 
     def test_canonical_truth_social_url(self) -> None:
         self.assertEqual(
             crawler.canonical_truth_social_url("https://www.truthsocial.com/realDonaldTrump/"),
-            "https://truthsocial.com/@realDonaldTrump",
+            "https://www.truthsocial.com/realDonaldTrump/",
         )
         self.assertEqual(
             crawler.canonical_truth_social_url("https://truthsocial.com/@realDonaldTrump"),
-            "https://truthsocial.com/@realDonaldTrump",
+            "https://www.truthsocial.com/realDonaldTrump/",
         )
 
 

@@ -408,15 +408,16 @@ def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
 
 def canonical_truth_social_url(value: str) -> str:
     url = value.strip().rstrip("/")
-    url = url.replace("https://www.truthsocial.com/", "https://truthsocial.com/")
-    url = url.replace("http://www.truthsocial.com/", "https://truthsocial.com/")
-    url = url.replace("http://truthsocial.com/", "https://truthsocial.com/")
+    url = url.replace("http://", "https://")
+    url = url.replace("https://truthsocial.com/", "https://www.truthsocial.com/")
 
-    prefix = "https://truthsocial.com/"
+    prefix = "https://www.truthsocial.com/"
     if url.startswith(prefix):
-        path = url[len(prefix):]
-        if path and not path.startswith("@") and "/" not in path:
-            return f"{prefix}@{path}"
+        path = url[len(prefix):].strip("/")
+        if path.startswith("@"):
+            path = path[1:]
+        if path and "/" not in path:
+            return f"{prefix}{path}/"
     return url
 
 
@@ -424,13 +425,10 @@ def fetch_truth_posts_from_apify() -> List[Dict[str, Any]]:
     payload = {
         "startUrls": [canonical_truth_social_url(TRUTH_SOCIAL_URL)],
         "maxItems": TRUTH_SOCIAL_FETCH_LIMIT,
-        "contentType": "posts",
-        "includeMuted": True,
-        "flattenOutput": True,
         "monitoringMode": False,
         "maxConcurrency": 1,
         "minConcurrency": 1,
-        "maxRequestRetries": int(os.getenv("TRUTH_SOCIAL_MAX_RETRIES", "10")),
+        "maxRequestRetries": int(os.getenv("TRUTH_SOCIAL_MAX_RETRIES", "100")),
     }
     return run_apify_actor(TRUTH_SOCIAL_ACTOR_ID, payload, TRUTH_SOCIAL_FETCH_LIMIT)
 
