@@ -4,7 +4,7 @@ import re
 import logging
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 
@@ -433,6 +433,95 @@ def fetch_truth_posts_from_apify() -> List[Dict[str, Any]]:
     return run_apify_actor(TRUTH_SOCIAL_ACTOR_ID, payload, TRUTH_SOCIAL_FETCH_LIMIT)
 
 
+def truth_social_diagnostic_payloads() -> List[tuple[str, Dict[str, Any]]]:
+    official_url = canonical_truth_social_url(TRUTH_SOCIAL_URL)
+    at_url = official_url.replace("https://www.truthsocial.com/", "https://truthsocial.com/@").rstrip("/")
+    diagnostic_date = os.getenv("TRUTH_SOCIAL_DIAGNOSTIC_DATE", "").strip()
+    if not diagnostic_date:
+        diagnostic_date = (datetime.now(timezone.utc) - timedelta(days=14)).date().isoformat()
+
+    base = {
+        "maxItems": TRUTH_SOCIAL_FETCH_LIMIT,
+        "maxConcurrency": 1,
+        "minConcurrency": 1,
+        "maxRequestRetries": int(os.getenv("TRUTH_SOCIAL_MAX_RETRIES", "100")),
+    }
+
+    return [
+        (
+            "official-url-no-date",
+            {**base, "startUrls": [official_url], "monitoringMode": False},
+        ),
+        (
+            "official-url-with-date",
+            {**base, "startUrls": [official_url], "date": diagnostic_date, "monitoringMode": False},
+        ),
+        (
+            "at-url-with-date",
+            {**base, "startUrls": [at_url], "date": diagnostic_date, "monitoringMode": False},
+        ),
+        (
+            "official-url-monitoring-mode",
+            {**base, "startUrls": [official_url], "date": diagnostic_date, "monitoringMode": True},
+        ),
+        (
+            "official-url-explicit-apify-proxy",
+            {
+                **base,
+                "startUrls": [official_url],
+                "date": diagnostic_date,
+                "monitoringMode": False,
+                "proxy": {"useApifyProxy": True},
+            },
+        ),
+    ]
+
+
+def run_truth_social_diagnostics() -> int:
+    logger.info(
+        "Starting Truth Social diagnostics actor=%s limit=%s url=%s",
+        TRUTH_SOCIAL_ACTOR_ID,
+        TRUTH_SOCIAL_FETCH_LIMIT,
+        TRUTH_SOCIAL_URL,
+    )
+    total_raw_items = 0
+    total_normalized_items = 0
+
+    for name, payload in truth_social_diagnostic_payloads():
+        logger.info("Truth Social diagnostic case=%s payload=%s", name, json.dumps(payload, sort_keys=True))
+        try:
+            raw_items = run_apify_actor(TRUTH_SOCIAL_ACTOR_ID, payload, TRUTH_SOCIAL_FETCH_LIMIT)
+        except Exception:
+            logger.exception("Truth Social diagnostic case=%s failed", name)
+            continue
+
+        normalized = [post for item in raw_items if (post := normalize_truth_post(item))]
+        total_raw_items += len(raw_items)
+        total_normalized_items += len(normalized)
+        logger.info(
+            "Truth Social diagnostic case=%s raw_items=%s normalized_items=%s",
+            name,
+            len(raw_items),
+            len(normalized),
+        )
+        for post in normalized[:3]:
+            logger.info(
+                "Truth Social diagnostic sample case=%s id=%s author=%s created_at=%s text=%s",
+                name,
+                post["tweet_id"],
+                post["author_handle"],
+                post.get("tweet_created_at"),
+                post["tweet_text"][:220],
+            )
+
+    logger.info(
+        "Truth Social diagnostic summary raw_items=%s normalized_items=%s",
+        total_raw_items,
+        total_normalized_items,
+    )
+    return 0 if total_raw_items else 1
+
+
 def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
     system_prompt = (
         "You are a cynical, highly analytical hedge fund macro analyst. "
@@ -558,6 +647,9 @@ def insert_insight(supabase: Client, tweet: Dict[str, Any], insight: Dict[str, A
 
 
 def main() -> int:
+    if os.getenv("TRUTH_SOCIAL_DIAGNOSTIC_MODE", "").lower() in {"1", "true", "yes"}:
+        return run_truth_social_diagnostics()
+
     try:
         supabase = get_supabase()
         processed_tweet_ids = fetch_processed_tweet_ids(supabase)

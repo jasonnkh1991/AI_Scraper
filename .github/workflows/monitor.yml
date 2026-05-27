@@ -28,6 +28,16 @@ on:
         required: false
         type: string
         default: "60"
+      truth_social_diagnostic_mode:
+        description: "Run only Truth Social Apify payload diagnostics"
+        required: false
+        type: boolean
+        default: false
+      truth_social_diagnostic_date:
+        description: "Truth Social diagnostic start date YYYY-MM-DD"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: monitor-x-list
@@ -71,5 +81,7 @@ jobs:
           TRUTH_SOCIAL_URL: https://www.truthsocial.com/realDonaldTrump/
           TRUTH_SOCIAL_FETCH_LIMIT: ${{ inputs.truth_social_fetch_limit || '3' }}
           TRUTH_SOCIAL_RUN_MINUTES: ${{ inputs.truth_social_run_minutes || '60' }}
+          TRUTH_SOCIAL_DIAGNOSTIC_MODE: ${{ inputs.truth_social_diagnostic_mode }}
+          TRUTH_SOCIAL_DIAGNOSTIC_DATE: ${{ inputs.truth_social_diagnostic_date }}
           MARKET_TIMEZONE: America/New_York
         run: python crawler.py
