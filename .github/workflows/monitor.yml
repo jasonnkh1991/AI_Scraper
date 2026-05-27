@@ -8,6 +8,26 @@ on:
         required: false
         type: boolean
         default: false
+      bypass_market_window:
+        description: "Bypass NY market window for manual diagnostics"
+        required: false
+        type: boolean
+        default: false
+      fetch_limit:
+        description: "X.com fetch limit"
+        required: false
+        type: string
+        default: "10"
+      truth_social_fetch_limit:
+        description: "Truth Social fetch limit"
+        required: false
+        type: string
+        default: "3"
+      truth_social_run_minutes:
+        description: "Truth Social run interval gate in minutes"
+        required: false
+        type: string
+        default: "60"
 
 concurrency:
   group: monitor-x-list
@@ -44,11 +64,12 @@ jobs:
           TWITTER_SEARCH_QUERY: ${{ secrets.TWITTER_SEARCH_QUERY }}
           APIFY_ACTOR_ID: pzMmk1t7AZ8OKJhfU
           SELF_TEST_MODE: ${{ inputs.self_test }}
-          FETCH_LIMIT: 10
+          FETCH_LIMIT: ${{ inputs.fetch_limit || '10' }}
+          BYPASS_MARKET_WINDOW: ${{ inputs.bypass_market_window }}
           TRUTH_SOCIAL_ENABLED: "true"
           TRUTH_SOCIAL_ACTOR_ID: IWIOv7oeNxfcjTnX5
           TRUTH_SOCIAL_URL: https://www.truthsocial.com/realDonaldTrump/
-          TRUTH_SOCIAL_FETCH_LIMIT: 3
-          TRUTH_SOCIAL_RUN_MINUTES: 60
+          TRUTH_SOCIAL_FETCH_LIMIT: ${{ inputs.truth_social_fetch_limit || '3' }}
+          TRUTH_SOCIAL_RUN_MINUTES: ${{ inputs.truth_social_run_minutes || '60' }}
           MARKET_TIMEZONE: America/New_York
         run: python crawler.py
