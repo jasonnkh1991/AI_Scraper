@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: "5"
+      truth_social_enabled:
+        description: "Enable Truth Social crawling"
+        required: false
+        type: boolean
+        default: false
       truth_social_fetch_limit:
         description: "Truth Social fetch limit"
         required: false
@@ -82,7 +87,7 @@ jobs:
           FETCH_LIMIT: ${{ inputs.fetch_limit || '10' }}
           OVERNIGHT_FETCH_LIMIT: ${{ inputs.overnight_fetch_limit || '5' }}
           BYPASS_MARKET_WINDOW: ${{ inputs.bypass_market_window }}
-          TRUTH_SOCIAL_ENABLED: "true"
+          TRUTH_SOCIAL_ENABLED: ${{ inputs.truth_social_enabled || false }}
           TRUTH_SOCIAL_ACTOR_ID: IWIOv7oeNxfcjTnX5
           TRUTH_SOCIAL_URL: https://www.truthsocial.com/realDonaldTrump/
           TRUTH_SOCIAL_FETCH_LIMIT: ${{ inputs.truth_social_fetch_limit || '3' }}
