@@ -632,6 +632,221 @@ def run_truth_social_diagnostics() -> int:
     return 0 if total_raw_items else 1
 
 
+def alert_session_title(count: int, group_count: int) -> str:
+    now = datetime.now(ZoneInfo(MARKET_TIMEZONE))
+    return (
+        f"<b>━━ 新一批市場訊號 ━━</b>\n"
+        f"<b>NY：</b>{html.escape(now.strftime('%Y-%m-%d %H:%M'))}\n"
+        f"<b>高優先 post：</b>{count} · <b>整合事件：</b>{group_count}\n"
+        f"<b>說明：</b>以下係今次 workflow 新偵測到嘅訊號，已盡量合併相近內容。"
+    )
+
+
+def post_telegram_message(message: str, disable_preview: bool = False) -> None:
+    bot_token = require_env("TELEGRAM_BOT_TOKEN")
+    chat_id = require_env("TELEGRAM_CHAT_ID")
+
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": disable_preview,
+            },
+            timeout=20,
+        )
+        if not response.ok:
+            logger.error("Telegram response: %s", response.text)
+        response.raise_for_status()
+    except Exception:
+        logger.exception("Telegram message failed")
+        raise
+
+
+def send_telegram_session_header(count: int, group_count: int) -> None:
+    post_telegram_message(alert_session_title(count, group_count), disable_preview=True)
+
+
+def signal_tokens(tweet: Dict[str, Any], insight: Dict[str, Any]) -> set[str]:
+    text = " ".join(
+        str(value or "")
+        for value in (
+            tweet.get("tweet_text"),
+            insight.get("summary_zh"),
+            insight.get("original_zh"),
+            insight.get("why_it_matters_zh"),
+            insight.get("market_mechanism_zh"),
+            " ".join(insight.get("target_sectors") or []),
+            " ".join(insight.get("affected_tickers") or []),
+        )
+    ).lower()
+    tokens = set(re.findall(r"[$]?[a-z][a-z0-9._-]{2,}", text))
+    stopwords = {
+        "the", "and", "for", "with", "from", "that", "this", "have", "has",
+        "will", "are", "was", "were", "market", "markets", "source", "tweet",
+        "watch", "impact", "risk", "sector", "sectors", "stock", "stocks",
+    }
+    return {token.lstrip("$") for token in tokens if token not in stopwords}
+
+
+def records_are_similar(left: Dict[str, Any], right: Dict[str, Any]) -> bool:
+    left_insight = left["insight"]
+    right_insight = right["insight"]
+    left_tickers = set(left_insight.get("affected_tickers") or [])
+    right_tickers = set(right_insight.get("affected_tickers") or [])
+    if left_tickers and right_tickers and left_tickers.intersection(right_tickers):
+        return True
+
+    left_tokens = left["tokens"]
+    right_tokens = right["tokens"]
+    if not left_tokens or not right_tokens:
+        return False
+    overlap = len(left_tokens.intersection(right_tokens))
+    union = len(left_tokens.union(right_tokens))
+    return overlap >= 4 and overlap / union >= 0.22
+
+
+def group_high_impact_records(records: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    groups: List[List[Dict[str, Any]]] = []
+    for record in records:
+        record["tokens"] = signal_tokens(record["tweet"], record["insight"])
+        placed = False
+        for group in groups:
+            if any(records_are_similar(record, existing) for existing in group):
+                group.append(record)
+                placed = True
+                break
+        if not placed:
+            groups.append([record])
+    return groups
+
+
+def merge_group_insight(group: List[Dict[str, Any]]) -> Dict[str, Any]:
+    insights = [item["insight"] for item in group]
+    primary = max(insights, key=lambda item: (int(item["impact_score"]), int(item.get("confidence_score", 0))))
+    sectors = sorted({sector for item in insights for sector in item.get("target_sectors", [])})
+    tickers = sorted({ticker for item in insights for ticker in item.get("affected_tickers", [])})
+    return {
+        **primary,
+        "impact_score": max(int(item["impact_score"]) for item in insights),
+        "confidence_score": max(int(item.get("confidence_score", 5)) for item in insights),
+        "target_sectors": sectors,
+        "affected_tickers": tickers,
+    }
+
+
+def truncate_text(value: Any, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def synthesize_group_insight(client: OpenAI, group: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(group) == 1:
+        return merge_group_insight(group)
+
+    payload = [
+        {
+            "author": f"@{item['tweet']['author_handle']}",
+            "created_at": item["tweet"].get("tweet_created_at"),
+            "url": item["tweet"]["tweet_url"],
+            "tweet_text": item["tweet"]["tweet_text"],
+            "insight": item["insight"],
+        }
+        for item in group
+    ]
+    try:
+        completion = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a hedge fund macro analyst consolidating multiple posts about the same market event. "
+                        "Return one integrated Traditional Chinese alert. Do not repeat duplicate facts. "
+                        "Preserve uncertainty and distinguish confirmed facts from unconfirmed reports. "
+                        "Use the strongest combined market mechanism, tickers, time horizon, and counter-risk."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                },
+            ],
+            temperature=0.1,
+            response_format={
+                "type": "json_schema",
+                "json_schema": INSIGHT_SCHEMA,
+            },
+        )
+        content = completion.choices[0].message.content
+        if not content:
+            raise ValueError("OpenAI returned empty group synthesis")
+        result = json.loads(content)
+        result["impact_score"] = int(result["impact_score"])
+        result["confidence_score"] = int(result.get("confidence_score", 5))
+        result["target_sectors"] = [str(x) for x in result.get("target_sectors", [])]
+        result["affected_tickers"] = [str(x).upper() for x in result.get("affected_tickers", [])]
+        return result
+    except Exception:
+        logger.exception("Group synthesis failed; using deterministic merge")
+        return merge_group_insight(group)
+
+
+def send_telegram_group_alert(group: List[Dict[str, Any]], merged: Dict[str, Any], index: int, total: int) -> None:
+    score = int(merged["impact_score"])
+    confidence = int(merged.get("confidence_score", 5))
+    score_emoji = "🔥🔥🔥" if score >= 9 else "🔥🔥"
+    sectors = ", ".join(merged.get("target_sectors") or ["未分類"])
+    tickers = ", ".join(merged.get("affected_tickers") or ["未能直接映射"])
+    sources = " / ".join(
+        f"@{item['tweet']['author_handle']}" for item in group[:6]
+    )
+    if len(group) > 6:
+        sources += f" / +{len(group) - 6}"
+
+    originals = "\n\n".join(
+        f"<b>{idx}. @{html.escape(item['tweet']['author_handle'])}</b>\n"
+        f"{html.escape(truncate_text(item['insight'].get('original_zh') or item['tweet']['tweet_text'], 700))}\n"
+        f"<a href=\"{html.escape(item['tweet']['tweet_url'])}\">原文</a>"
+        for idx, item in enumerate(group[:4], start=1)
+    )
+    if len(group) > 4:
+        originals += f"\n\n其餘 {len(group) - 4} 條相近 post 已合併，詳情可喺 Dashboard 睇。"
+
+    message = f"""
+<b>{score_emoji} 市場高優先級警報 {index}/{total}</b>
+<b>整合：</b>{len(group)} 條相近 post
+<b>來源：</b>{html.escape(sources)}
+<b>Impact：</b>{score}/10 · <b>Confidence：</b>{confidence}/10
+<b>Source：</b>{html.escape(str(merged.get("source_quality", "unknown")))} · <b>時窗：</b>{html.escape(str(merged.get("time_horizon", "unclear")))}
+<b>板塊：</b>{html.escape(sectors)}
+<b>Ticker：</b>{html.escape(tickers)}
+
+<b>整合重點：</b>
+{html.escape(truncate_text(merged.get("summary_zh", ""), 700))}
+
+<b>點解重要：</b>
+{html.escape(truncate_text(merged.get("why_it_matters_zh", ""), 700))}
+
+<b>影響鏈：</b>
+{html.escape(truncate_text(merged.get("market_mechanism_zh", ""), 700))}
+
+<b>交易觀察：</b>
+{html.escape(truncate_text(merged.get("trading_action", ""), 500))}
+
+<b>反面風險：</b>
+{html.escape(truncate_text(merged.get("risk_zh", ""), 500))}
+
+<b>原文翻譯：</b>
+{originals}
+""".strip()
+    post_telegram_message(message, disable_preview=False)
+
+
 def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
     system_prompt = (
         "You are a cynical, highly analytical hedge fund macro analyst writing for an active investor. "
@@ -686,8 +901,6 @@ def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
-    bot_token = require_env("TELEGRAM_BOT_TOKEN")
-    chat_id = require_env("TELEGRAM_CHAT_ID")
     score = int(insight["impact_score"])
     confidence = int(insight.get("confidence_score", 5))
     score_emoji = "🔥🔥🔥" if score >= 9 else "🔥🔥"
@@ -724,19 +937,7 @@ def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
 """.strip()
 
     try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
-            timeout=20,
-        )
-        if not response.ok:
-            logger.error("Telegram response: %s", response.text)
-        response.raise_for_status()
+        post_telegram_message(message, disable_preview=False)
     except Exception:
         logger.exception("Telegram alert failed for tweet_id=%s", tweet["tweet_id"])
         raise
@@ -890,13 +1091,14 @@ def main() -> int:
     logger.info("Processing %s new tweets", len(new_tweets))
     fully_processed = True
     latest_processed_tweet_id = str(last_processed_id)
+    high_impact_records: List[Dict[str, Any]] = []
 
     for tweet in new_tweets:
         try:
             insight = evaluate_tweet(openai_client, tweet)
             if insight["has_market_impact"] and insight["impact_score"] >= 7:
-                send_telegram_alert(tweet, insight)
                 insert_insight(supabase, tweet, insight)
+                high_impact_records.append({"tweet": tweet, "insight": insight})
                 logger.info(
                     "Stored high-impact tweet_id=%s score=%s",
                     tweet["tweet_id"],
@@ -910,6 +1112,17 @@ def main() -> int:
             fully_processed = False
             logger.exception("Stopped before advancing state past tweet_id=%s", tweet["tweet_id"])
             break
+
+    if fully_processed and high_impact_records:
+        try:
+            groups = group_high_impact_records(high_impact_records)
+            logger.info("Sending %s high-impact records as %s Telegram groups", len(high_impact_records), len(groups))
+            send_telegram_session_header(len(high_impact_records), len(groups))
+            for index, group in enumerate(groups, start=1):
+                merged = synthesize_group_insight(openai_client, group)
+                send_telegram_group_alert(group, merged, index, len(groups))
+        except Exception:
+            return 1
 
     if fully_processed:
         try:
