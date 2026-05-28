@@ -63,19 +63,48 @@ INSIGHT_SCHEMA = {
                 "minimum": 1,
                 "maximum": 10,
             },
+            "confidence_score": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+            },
+            "source_quality": {
+                "type": "string",
+                "enum": ["primary", "reputable_media", "terminal_scrape", "rumor", "unknown"],
+            },
+            "time_horizon": {
+                "type": "string",
+                "enum": ["intraday", "days", "weeks", "months", "unclear"],
+            },
             "target_sectors": {
                 "type": "array",
                 "items": {"type": "string"},
             },
+            "affected_tickers": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
             "summary_zh": {"type": "string"},
+            "original_zh": {"type": "string"},
+            "why_it_matters_zh": {"type": "string"},
+            "market_mechanism_zh": {"type": "string"},
             "trading_action": {"type": "string"},
+            "risk_zh": {"type": "string"},
         },
         "required": [
             "has_market_impact",
             "impact_score",
+            "confidence_score",
+            "source_quality",
+            "time_horizon",
             "target_sectors",
+            "affected_tickers",
             "summary_zh",
+            "original_zh",
+            "why_it_matters_zh",
+            "market_mechanism_zh",
             "trading_action",
+            "risk_zh",
         ],
     },
 }
@@ -605,11 +634,13 @@ def run_truth_social_diagnostics() -> int:
 
 def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
     system_prompt = (
-        "You are a cynical, highly analytical hedge fund macro analyst. "
-        "Your job is to identify only tweets with real market impact. "
-        "Ignore lifestyle chatter, engagement bait, vague rumors, stale news, memes, "
-        "generic political outrage, and duplicate noise. Be skeptical. "
-        "Return Traditional Chinese for summary_zh. Keep it punchy and investor-focused."
+        "You are a cynical, highly analytical hedge fund macro analyst writing for an active investor. "
+        "Filter aggressively: ignore lifestyle chatter, engagement bait, stale news, memes, vague rumors, "
+        "generic political outrage, and duplicate noise unless it changes market odds. "
+        "Prioritize concrete catalysts: policy, tariffs, war/energy shocks, SEC filings, 13F/13G, AI infrastructure deals, "
+        "earnings/guidance, supply chain constraints, rates/FX/commodities, antitrust/regulation, and named tickers. "
+        "Return Traditional Chinese. Be concise but analytical: explain mechanism, impacted tickers, time horizon, confidence, "
+        "and the strongest counterargument. Never invent facts that are not in the post; mark uncertainty clearly."
     )
     user_prompt = (
         f"Author: @{tweet['author_handle']} ({tweet['author_name']})\n"
@@ -617,7 +648,14 @@ def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
         f"Tweet URL: {tweet['tweet_url']}\n\n"
         f"Tweet:\n{tweet['tweet_text']}\n\n"
         "Decide whether this can plausibly move listed equities, crypto, rates, FX, "
-        "commodities, or a clearly identifiable market sector in the near term."
+        "commodities, or a clearly identifiable market sector in the near term. "
+        "For original_zh, translate the tweet/post into readable Traditional Chinese. "
+        "For why_it_matters_zh, explain why an investor should care, not just what happened. "
+        "For market_mechanism_zh, describe the transmission path, e.g. policy -> sector demand -> tickers, "
+        "or filing -> positioning signal -> valuation narrative. "
+        "For affected_tickers, include concrete US tickers when plausible; otherwise use sector names sparingly. "
+        "For trading_action, give watchlist/direction/levels of attention, not financial advice. "
+        "Set confidence_score lower for unconfirmed source/rumor even if impact_score is high."
     )
 
     try:
@@ -638,7 +676,9 @@ def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError("OpenAI returned empty content")
         result = json.loads(content)
         result["impact_score"] = int(result["impact_score"])
+        result["confidence_score"] = int(result.get("confidence_score", 5))
         result["target_sectors"] = [str(x) for x in result.get("target_sectors", [])]
+        result["affected_tickers"] = [str(x).upper() for x in result.get("affected_tickers", [])]
         return result
     except Exception:
         logger.exception("OpenAI evaluation failed for tweet_id=%s", tweet["tweet_id"])
@@ -649,20 +689,36 @@ def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
     bot_token = require_env("TELEGRAM_BOT_TOKEN")
     chat_id = require_env("TELEGRAM_CHAT_ID")
     score = int(insight["impact_score"])
+    confidence = int(insight.get("confidence_score", 5))
     score_emoji = "🔥🔥🔥" if score >= 9 else "🔥🔥"
     sectors = ", ".join(insight.get("target_sectors") or ["未分類"])
+    tickers = ", ".join(insight.get("affected_tickers") or ["未能直接映射"])
     message = f"""
 <b>{score_emoji} 市場高優先級警報</b>
 
 <b>來源：</b>@{html.escape(tweet["author_handle"])} · {html.escape(tweet["author_name"])}
-<b>Impact：</b>{score}/10
+<b>Impact：</b>{score}/10 · <b>Confidence：</b>{confidence}/10
+<b>Source：</b>{html.escape(str(insight.get("source_quality", "unknown")))} · <b>時窗：</b>{html.escape(str(insight.get("time_horizon", "unclear")))}
 <b>板塊：</b>{html.escape(sectors)}
+<b>Ticker：</b>{html.escape(tickers)}
+
+<b>原文翻譯：</b>
+{html.escape(str(insight.get("original_zh") or tweet["tweet_text"]))}
 
 <b>重點：</b>
 {html.escape(insight["summary_zh"])}
 
+<b>點解重要：</b>
+{html.escape(str(insight.get("why_it_matters_zh", "")))}
+
+<b>影響鏈：</b>
+{html.escape(str(insight.get("market_mechanism_zh", "")))}
+
 <b>交易觀察：</b>
 {html.escape(insight["trading_action"])}
+
+<b>反面風險：</b>
+{html.escape(str(insight.get("risk_zh", "")))}
 
 <a href="{html.escape(tweet["tweet_url"])}">查看原 Tweet</a>
 """.strip()
@@ -697,9 +753,17 @@ def run_self_test(supabase: Client) -> None:
     }
     insight = {
         "impact_score": 10,
+        "confidence_score": 10,
+        "source_quality": "primary",
+        "time_horizon": "intraday",
         "target_sectors": ["System Test"],
+        "affected_tickers": [],
         "summary_zh": "系統測試：如果你喺 Telegram、Supabase insights 同 Dashboard 都見到呢條訊息，代表三段鏈路已經打通。",
+        "original_zh": "Telegram、Supabase 同 Dashboard 的合成測試記錄。",
+        "why_it_matters_zh": "用嚟確認新欄位、深度訊息格式同資料庫寫入都正常。",
+        "market_mechanism_zh": "無市場影響；只係系統端到端驗證。",
         "trading_action": "無需交易；呢條係測試訊號，可以驗證後喺 Supabase 刪除。",
+        "risk_zh": "無市場風險。",
     }
     send_telegram_alert(tweet, insight)
     insert_insight(supabase, tweet, insight)
@@ -718,11 +782,48 @@ def insert_insight(supabase: Client, tweet: Dict[str, Any], insight: Dict[str, A
         "target_sectors": insight["target_sectors"],
         "summary_zh": insight["summary_zh"],
         "trading_action": insight["trading_action"],
+        "original_zh": insight.get("original_zh"),
+        "why_it_matters_zh": insight.get("why_it_matters_zh"),
+        "market_mechanism_zh": insight.get("market_mechanism_zh"),
+        "affected_tickers": insight.get("affected_tickers", []),
+        "confidence_score": insight.get("confidence_score"),
+        "time_horizon": insight.get("time_horizon"),
+        "source_quality": insight.get("source_quality"),
+        "risk_zh": insight.get("risk_zh"),
     }
 
     try:
         supabase.table("insights").upsert(row, on_conflict="tweet_id").execute()
-    except Exception:
+    except Exception as error:
+        message = str(error)
+        if any(column in message for column in (
+            "original_zh",
+            "why_it_matters_zh",
+            "market_mechanism_zh",
+            "affected_tickers",
+            "confidence_score",
+            "time_horizon",
+            "source_quality",
+            "risk_zh",
+        )):
+            logger.warning("Supabase insights table missing Step 2 columns; retrying legacy insert for tweet_id=%s", tweet["tweet_id"])
+            legacy_row = {
+                key: row[key]
+                for key in (
+                    "tweet_id",
+                    "author_handle",
+                    "author_name",
+                    "tweet_text",
+                    "tweet_url",
+                    "tweet_created_at",
+                    "impact_score",
+                    "target_sectors",
+                    "summary_zh",
+                    "trading_action",
+                )
+            }
+            supabase.table("insights").upsert(legacy_row, on_conflict="tweet_id").execute()
+            return
         logger.exception("Supabase insert failed for tweet_id=%s", tweet["tweet_id"])
         raise
 

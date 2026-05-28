@@ -16,14 +16,38 @@ create table if not exists public.insights (
   target_sectors text[] not null default '{}',
   summary_zh text not null,
   trading_action text not null,
+  original_zh text,
+  why_it_matters_zh text,
+  market_mechanism_zh text,
+  affected_tickers text[] not null default '{}',
+  confidence_score int check (confidence_score between 1 and 10),
+  time_horizon text,
+  source_quality text,
+  risk_zh text,
   inserted_at timestamptz not null default now()
 );
+
+alter table public.insights
+  add column if not exists original_zh text,
+  add column if not exists why_it_matters_zh text,
+  add column if not exists market_mechanism_zh text,
+  add column if not exists affected_tickers text[] not null default '{}',
+  add column if not exists confidence_score int check (confidence_score between 1 and 10),
+  add column if not exists time_horizon text,
+  add column if not exists source_quality text,
+  add column if not exists risk_zh text;
 
 create index if not exists insights_inserted_at_idx
   on public.insights (inserted_at desc);
 
 create index if not exists insights_impact_score_idx
   on public.insights (impact_score desc);
+
+create index if not exists insights_affected_tickers_idx
+  on public.insights using gin (affected_tickers);
+
+create index if not exists insights_confidence_score_idx
+  on public.insights (confidence_score desc);
 
 insert into public.system_states (key, value)
 values ('last_processed_tweet_id', '0')
