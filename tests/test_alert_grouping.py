@@ -58,6 +58,26 @@ class AlertGroupingTest(unittest.TestCase):
 
         self.assertEqual(len(groups), 2)
 
+    def test_event_fingerprint_prefers_tickers(self) -> None:
+        group = [record("1", "Snowflake AWS AI compute deal", ["SNOW", "AMZN"])]
+        for item in group:
+            item["tokens"] = crawler.signal_tokens(item["tweet"], item["insight"])
+
+        self.assertEqual(crawler.event_fingerprint(group), "tickers:AMZN,SNOW")
+
+    def test_mark_event_status_detects_prior_session_update(self) -> None:
+        group = [record("1", "Snowflake AWS AI compute deal", ["SNOW"])]
+        for item in group:
+            item["tokens"] = crawler.signal_tokens(item["tweet"], item["insight"])
+        merged = crawler.merge_group_insight(group)
+        recent = {"tickers:SNOW": "2026-05-29T01:00:00+00:00"}
+
+        statuses = crawler.mark_event_status([group], [merged], recent)
+
+        self.assertTrue(statuses[0]["is_update"])
+        self.assertEqual(statuses[0]["previous_seen_at"], "2026-05-29T01:00:00+00:00")
+        self.assertIn("tickers:SNOW", recent)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,10 @@ TIER2_FETCH_LIMIT = int(os.getenv("TIER2_FETCH_LIMIT", "20"))
 OVERNIGHT_FETCH_LIMIT = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "10"))
 STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
+RECENT_EVENT_FINGERPRINTS_KEY = "recent_event_fingerprints"
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
+EVENT_MEMORY_HOURS = int(os.getenv("EVENT_MEMORY_HOURS", "6"))
+MAX_TRACKED_EVENTS = int(os.getenv("MAX_TRACKED_EVENTS", "300"))
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
 TRUTH_SOCIAL_ENABLED = os.getenv("TRUTH_SOCIAL_ENABLED", "true").lower() in {"1", "true", "yes"}
 TRUTH_SOCIAL_ACTOR_ID = os.getenv("TRUTH_SOCIAL_ACTOR_ID", "IWIOv7oeNxfcjTnX5")
@@ -375,6 +378,39 @@ def save_processed_tweet_ids(supabase: Client, tweet_ids: set[str]) -> None:
         save_state_value(supabase, PROCESSED_TWEET_IDS_KEY, json.dumps(ordered))
     except Exception:
         logger.exception("Failed to save processed tweet ids to Supabase")
+        raise
+
+
+def fetch_recent_event_fingerprints(supabase: Client) -> Dict[str, str]:
+    try:
+        value = fetch_state_value(supabase, RECENT_EVENT_FINGERPRINTS_KEY)
+        if not value:
+            return {}
+        data = json.loads(value)
+        if not isinstance(data, dict):
+            return {}
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=EVENT_MEMORY_HOURS)
+        active: Dict[str, str] = {}
+        for fingerprint, timestamp in data.items():
+            try:
+                seen_at = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if seen_at >= cutoff:
+                active[str(fingerprint)] = seen_at.astimezone(timezone.utc).isoformat()
+        return active
+    except Exception:
+        logger.exception("Failed to fetch recent event fingerprints")
+        return {}
+
+
+def save_recent_event_fingerprints(supabase: Client, fingerprints: Dict[str, str]) -> None:
+    ordered = sorted(fingerprints.items(), key=lambda item: item[1], reverse=True)[:MAX_TRACKED_EVENTS]
+    try:
+        save_state_value(supabase, RECENT_EVENT_FINGERPRINTS_KEY, json.dumps(dict(ordered)))
+    except Exception:
+        logger.exception("Failed to save recent event fingerprints")
         raise
 
 
@@ -737,6 +773,38 @@ def merge_group_insight(group: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def event_fingerprint(group: List[Dict[str, Any]], merged: Optional[Dict[str, Any]] = None) -> str:
+    insight = merged or merge_group_insight(group)
+    tickers = sorted(str(ticker).upper().lstrip("$") for ticker in insight.get("affected_tickers", []) if str(ticker).strip())
+    if tickers:
+        return "tickers:" + ",".join(tickers[:6])
+
+    sectors = sorted(str(sector).lower().strip() for sector in insight.get("target_sectors", []) if str(sector).strip())
+    token_sets = [item.get("tokens") or signal_tokens(item["tweet"], item["insight"]) for item in group]
+    tokens = sorted(set().union(*token_sets)) if token_sets else []
+    core_tokens = [token for token in tokens if token not in {"news", "report", "reports", "update", "shares"}][:8]
+    return "topic:" + ",".join((sectors[:3] + core_tokens)[:10])
+
+
+def mark_event_status(
+    groups: List[List[Dict[str, Any]]],
+    merged_insights: List[Dict[str, Any]],
+    recent_events: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    now = datetime.now(timezone.utc).isoformat()
+    statuses: List[Dict[str, Any]] = []
+    for group, merged in zip(groups, merged_insights):
+        fingerprint = event_fingerprint(group, merged)
+        previous = recent_events.get(fingerprint)
+        statuses.append({
+            "fingerprint": fingerprint,
+            "is_update": bool(previous),
+            "previous_seen_at": previous,
+        })
+        recent_events[fingerprint] = now
+    return statuses
+
+
 def truncate_text(value: Any, limit: int) -> str:
     text = str(value or "").strip()
     if len(text) <= limit:
@@ -796,7 +864,13 @@ def synthesize_group_insight(client: OpenAI, group: List[Dict[str, Any]]) -> Dic
         return merge_group_insight(group)
 
 
-def send_telegram_group_alert(group: List[Dict[str, Any]], merged: Dict[str, Any], index: int, total: int) -> None:
+def send_telegram_group_alert(
+    group: List[Dict[str, Any]],
+    merged: Dict[str, Any],
+    index: int,
+    total: int,
+    event_status: Optional[Dict[str, Any]] = None,
+) -> None:
     score = int(merged["impact_score"])
     confidence = int(merged.get("confidence_score", 5))
     score_emoji = "🔥🔥🔥" if score >= 9 else "🔥🔥"
@@ -817,9 +891,18 @@ def send_telegram_group_alert(group: List[Dict[str, Any]], merged: Dict[str, Any
     if len(group) > 4:
         originals += f"\n\n其餘 {len(group) - 4} 條相近 post 已合併，詳情可喺 Dashboard 睇。"
 
+    is_update = bool(event_status and event_status.get("is_update"))
+    status_label = "事件更新" if is_update else "全新事件"
+    previous_line = (
+        f"<b>上次見到：</b>{html.escape(str(event_status.get('previous_seen_at')))}\n"
+        if is_update and event_status and event_status.get("previous_seen_at")
+        else ""
+    )
+
     message = f"""
 <b>{score_emoji} 市場高優先級警報 {index}/{total}</b>
-<b>整合：</b>{len(group)} 條相近 post
+<b>狀態：</b>{status_label}
+{previous_line}<b>整合：</b>{len(group)} 條相近 post
 <b>來源：</b>{html.escape(sources)}
 <b>Impact：</b>{score}/10 · <b>Confidence：</b>{confidence}/10
 <b>Source：</b>{html.escape(str(merged.get("source_quality", "unknown")))} · <b>時窗：</b>{html.escape(str(merged.get("time_horizon", "unclear")))}
@@ -1036,6 +1119,7 @@ def main() -> int:
     try:
         supabase = get_supabase()
         processed_tweet_ids = fetch_processed_tweet_ids(supabase)
+        recent_events = fetch_recent_event_fingerprints(supabase)
         if os.getenv("SELF_TEST_MODE", "").lower() in {"1", "true", "yes"}:
             run_self_test(supabase)
             return 0
@@ -1118,9 +1202,10 @@ def main() -> int:
             groups = group_high_impact_records(high_impact_records)
             logger.info("Sending %s high-impact records as %s Telegram groups", len(high_impact_records), len(groups))
             send_telegram_session_header(len(high_impact_records), len(groups))
-            for index, group in enumerate(groups, start=1):
-                merged = synthesize_group_insight(openai_client, group)
-                send_telegram_group_alert(group, merged, index, len(groups))
+            merged_insights = [synthesize_group_insight(openai_client, group) for group in groups]
+            event_statuses = mark_event_status(groups, merged_insights, recent_events)
+            for index, (group, merged, event_status) in enumerate(zip(groups, merged_insights, event_statuses), start=1):
+                send_telegram_group_alert(group, merged, index, len(groups), event_status)
         except Exception:
             return 1
 
@@ -1128,11 +1213,13 @@ def main() -> int:
         try:
             save_last_processed_tweet_id(supabase, latest_processed_tweet_id)
             save_processed_tweet_ids(supabase, processed_tweet_ids)
+            save_recent_event_fingerprints(supabase, recent_events)
             logger.info(
-                "Saved %s=%s and tracked_seen_ids=%s",
+                "Saved %s=%s tracked_seen_ids=%s tracked_events=%s",
                 STATE_KEY,
                 latest_processed_tweet_id,
                 len(processed_tweet_ids),
+                len(recent_events),
             )
         except Exception:
             return 1
