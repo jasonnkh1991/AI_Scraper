@@ -15,8 +15,9 @@ from supabase import Client, create_client
 
 APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "pzMmk1t7AZ8OKJhfU")
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
-FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "5"))
-OVERNIGHT_FETCH_LIMIT = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "5"))
+FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", os.getenv("TIER1_FETCH_LIMIT", "40")))
+TIER2_FETCH_LIMIT = int(os.getenv("TIER2_FETCH_LIMIT", "20"))
+OVERNIGHT_FETCH_LIMIT = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "10"))
 STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
@@ -26,14 +27,20 @@ TRUTH_SOCIAL_ACTOR_ID = os.getenv("TRUTH_SOCIAL_ACTOR_ID", "IWIOv7oeNxfcjTnX5")
 TRUTH_SOCIAL_URL = os.getenv("TRUTH_SOCIAL_URL", "https://www.truthsocial.com/realDonaldTrump/")
 TRUTH_SOCIAL_FETCH_LIMIT = int(os.getenv("TRUTH_SOCIAL_FETCH_LIMIT", "3"))
 TRUTH_SOCIAL_RUN_MINUTES = int(os.getenv("TRUTH_SOCIAL_RUN_MINUTES", "60"))
-DEFAULT_TWITTER_SEARCH_QUERY = (
-    "(from:realDonaldTrump OR from:TrumpDailyPosts OR from:RNCResearch OR "
-    "from:Acyn OR from:DeitaOne OR from:FinancialJuice OR "
-    "from:unusual_whales OR from:dylan522p OR from:IanCutress OR "
-    "from:tomshardware OR from:elonmusk OR from:samaltman OR "
-    "from:satyanadella OR from:sundarpichai OR from:POTUS) "
+DEFAULT_TIER1_TWITTER_SEARCH_QUERY = (
+    "(from:DeItaone OR from:financialjuice OR from:unusual_whales OR "
+    "from:zerohedge OR from:WSJ OR from:CNBC OR from:business OR "
+    "from:Reuters OR from:ReutersBiz OR from:Benzinga) "
     "-filter:replies lang:en"
 )
+DEFAULT_TIER2_TWITTER_SEARCH_QUERY = (
+    "(from:elonmusk OR from:sama OR from:satyanadella OR "
+    "from:sundarpichai OR from:dylan522p OR from:IanCutress OR "
+    "from:tomshardware OR from:StockMKTNewz OR from:KobeissiLetter OR "
+    "from:FirstSquawk) "
+    "-filter:replies lang:en"
+)
+DEFAULT_TWITTER_SEARCH_QUERY = DEFAULT_TIER1_TWITTER_SEARCH_QUERY
 
 
 logging.basicConfig(
@@ -229,6 +236,30 @@ def current_x_fetch_limit(now: Optional[datetime] = None) -> int:
     return OVERNIGHT_FETCH_LIMIT if is_overnight_window(now) else FETCH_LIMIT
 
 
+def should_run_tier2(now: Optional[datetime] = None) -> bool:
+    if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
+        return True
+
+    current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
+    if is_overnight_window(current):
+        return False
+    if not should_run_market_window(current):
+        return False
+    return current.minute == 7
+
+
+def is_twitter_search_actor() -> bool:
+    return APIFY_ACTOR_ID == "pzMmk1t7AZ8OKJhfU" or "twitter-tweets-scraper" in APIFY_ACTOR_ID
+
+
+def tier_twitter_query(tier: int) -> str:
+    if tier == 1:
+        return (os.getenv("TIER1_TWITTER_SEARCH_QUERY") or DEFAULT_TIER1_TWITTER_SEARCH_QUERY).strip()
+    if tier == 2:
+        return (os.getenv("TIER2_TWITTER_SEARCH_QUERY") or DEFAULT_TIER2_TWITTER_SEARCH_QUERY).strip()
+    raise ValueError(f"Unsupported Twitter tier: {tier}")
+
+
 def should_run_truth_social(now: Optional[datetime] = None) -> bool:
     if not TRUTH_SOCIAL_ENABLED:
         return False
@@ -363,15 +394,15 @@ def fetch_apify_run_log(run_id: str, token: str) -> Optional[str]:
         return None
 
 
-def build_apify_payload(fetch_limit: Optional[int] = None) -> Dict[str, Any]:
+def build_apify_payload(fetch_limit: Optional[int] = None, query: Optional[str] = None) -> Dict[str, Any]:
     limit = fetch_limit if fetch_limit is not None else current_x_fetch_limit()
-    if APIFY_ACTOR_ID == "pzMmk1t7AZ8OKJhfU" or "twitter-tweets-scraper" in APIFY_ACTOR_ID:
-        query = os.getenv("TWITTER_SEARCH_QUERY", DEFAULT_TWITTER_SEARCH_QUERY).strip()
-        if not query:
-            raise RuntimeError("Missing TWITTER_SEARCH_QUERY")
+    if is_twitter_search_actor():
+        search_query = (query or DEFAULT_TWITTER_SEARCH_QUERY).strip()
+        if not search_query:
+            raise RuntimeError("Missing Twitter search query")
         return {
             "mode": "Advanced Search",
-            "query": query,
+            "query": search_query,
             "query_type": "Latest",
             "max_results": limit,
         }
@@ -426,9 +457,34 @@ def run_apify_actor(actor_id: str, payload: Dict[str, Any], limit: int) -> List[
 
 
 def fetch_tweets_from_apify() -> List[Dict[str, Any]]:
-    limit = current_x_fetch_limit()
-    logger.info("Using X fetch limit=%s", limit)
-    return run_apify_actor(APIFY_ACTOR_ID, build_apify_payload(limit), limit)
+    if not is_twitter_search_actor():
+        limit = current_x_fetch_limit()
+        logger.info("Using legacy X list fetch limit=%s", limit)
+        return run_apify_actor(APIFY_ACTOR_ID, build_apify_payload(limit), limit)
+
+    tier1_limit = current_x_fetch_limit()
+    tier1_query = tier_twitter_query(1)
+    logger.info("Fetching X Tier 1 limit=%s query=%s", tier1_limit, tier1_query)
+    items = run_apify_actor(
+        APIFY_ACTOR_ID,
+        build_apify_payload(tier1_limit, tier1_query),
+        tier1_limit,
+    )
+
+    if should_run_tier2():
+        tier2_query = tier_twitter_query(2)
+        logger.info("Fetching X Tier 2 limit=%s query=%s", TIER2_FETCH_LIMIT, tier2_query)
+        items.extend(
+            run_apify_actor(
+                APIFY_ACTOR_ID,
+                build_apify_payload(TIER2_FETCH_LIMIT, tier2_query),
+                TIER2_FETCH_LIMIT,
+            )
+        )
+    else:
+        logger.info("X Tier 2 fetch skipped for this run.")
+
+    return items
 
 
 def canonical_truth_social_url(value: str) -> str:

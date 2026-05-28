@@ -14,7 +14,7 @@ supabase_stub.Client = object
 supabase_stub.create_client = lambda *_args, **_kwargs: object()
 sys.modules.setdefault("supabase", supabase_stub)
 
-from crawler import current_x_fetch_limit, should_run_market_window, should_run_truth_social
+from crawler import current_x_fetch_limit, should_run_market_window, should_run_tier2, should_run_truth_social
 
 
 def ny_time(hour: int, minute: int) -> datetime:
@@ -49,6 +49,13 @@ class MarketWindowTest(unittest.TestCase):
 
         self.assertEqual(current_x_fetch_limit(ny_time(1, 7)), crawler.OVERNIGHT_FETCH_LIMIT)
         self.assertEqual(current_x_fetch_limit(ny_time(6, 7)), crawler.FETCH_LIMIT)
+
+    def test_tier2_runs_hourly_outside_overnight(self) -> None:
+        self.assertTrue(should_run_tier2(ny_time(6, 7)))
+        self.assertFalse(should_run_tier2(ny_time(6, 22)))
+        self.assertTrue(should_run_tier2(ny_time(20, 7)))
+        self.assertFalse(should_run_tier2(ny_time(23, 37)))
+        self.assertFalse(should_run_tier2(ny_time(0, 7)))
 
     def test_bypass_market_window(self) -> None:
         os.environ["BYPASS_MARKET_WINDOW"] = "true"
