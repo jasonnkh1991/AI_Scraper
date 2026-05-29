@@ -1865,8 +1865,10 @@ def main() -> int:
         return 1
 
     if not fully_processed:
-        logger.warning("Batch had %s AI failures; queued rows were retained or marked failed by attempts.", ai_failure_count)
-        return 1
+        logger.warning(
+            "Batch had %s transient AI failures; affected queued rows were retained or marked failed by attempts.",
+            ai_failure_count,
+        )
 
     return 0
 
