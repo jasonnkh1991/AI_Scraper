@@ -87,6 +87,37 @@ class AlertGroupingTest(unittest.TestCase):
         self.assertIn("https://x.com/source/status/1", message)
         self.assertIn("@source", message)
 
+    def test_telegram_html_to_markdown_keeps_links(self) -> None:
+        message = '<b>Alert</b> <a href="https://x.com/a/status/1">原文</a>'
+
+        markdown = crawler.telegram_html_to_markdown(message)
+
+        self.assertIn("Alert", markdown)
+        self.assertIn("原文 (https://x.com/a/status/1)", markdown)
+
+    def test_daily_study_markdown_groups_alerts(self) -> None:
+        alerts = [
+            {
+                "alert_type": "group_alert",
+                "title": "AI deal",
+                "message_markdown": "SNOW signs AI deal",
+                "source_tweet_urls": ["https://x.com/source/status/1"],
+                "impact_max": 8,
+                "confidence_avg": 7,
+                "tickers": ["SNOW"],
+                "sectors": ["AI Infrastructure"],
+                "period_start": "2026-05-29T01:00:00+08:00",
+                "created_at": "2026-05-29T01:00:00+08:00",
+            }
+        ]
+
+        markdown = crawler.build_daily_study_markdown(alerts, "2026-05-29")
+
+        self.assertIn("Daily Market Study Brief", markdown)
+        self.assertIn("Overnight 00:00-08:00", markdown)
+        self.assertIn("SNOW signs AI deal", markdown)
+        self.assertIn("https://x.com/source/status/1", markdown)
+
 
 if __name__ == "__main__":
     unittest.main()

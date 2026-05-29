@@ -6,7 +6,7 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from openai import OpenAI
@@ -28,6 +28,7 @@ STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
 RECENT_EVENT_FINGERPRINTS_KEY = "recent_event_fingerprints"
 LAST_DIGEST_DATE_KEY = "last_overnight_digest_date"
+ALERT_ARCHIVE_ENABLED = os.getenv("ALERT_ARCHIVE_ENABLED", "true").lower() in {"1", "true", "yes"}
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
 EVENT_MEMORY_HOURS = int(os.getenv("EVENT_MEMORY_HOURS", "6"))
 MAX_TRACKED_EVENTS = int(os.getenv("MAX_TRACKED_EVENTS", "300"))
@@ -531,6 +532,179 @@ def format_digest_source_links(group: List[Dict[str, Any]]) -> str:
     return " / ".join(links)
 
 
+def telegram_html_to_markdown(message: str) -> str:
+    text = re.sub(r'<a\s+href="([^"]+)"[^>]*>(.*?)</a>', r'\2 (\1)', message)
+    text = re.sub(r'</(b|strong|i|em)>', '', text)
+    text = re.sub(r'<(b|strong|i|em)>', '', text)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = html.unescape(text)
+    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
+
+
+def group_period(group: List[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+    values = [item["tweet"].get("tweet_created_at") for item in group if item["tweet"].get("tweet_created_at")]
+    if not values:
+        return None, None
+    return min(values), max(values)
+
+
+def alert_metadata_from_group(group: List[Dict[str, Any]], merged: Dict[str, Any]) -> Dict[str, Any]:
+    period_start, period_end = group_period(group)
+    confidences = [int(item["insight"].get("confidence_score") or 0) for item in group]
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "insight_ids": [str(item["tweet"].get("tweet_id") or "") for item in group if item["tweet"].get("tweet_id")],
+        "source_tweet_urls": [str(item["tweet"].get("tweet_url") or "") for item in group if item["tweet"].get("tweet_url")],
+        "impact_max": int(merged.get("impact_score") or 0) or None,
+        "confidence_avg": round(sum(confidences) / len(confidences), 2) if confidences else None,
+        "tickers": sorted({str(ticker).upper() for item in group for ticker in item["insight"].get("affected_tickers", []) if str(ticker).strip()}),
+        "sectors": sorted({str(sector) for item in group for sector in item["insight"].get("target_sectors", []) if str(sector).strip()}),
+    }
+
+
+def hkt_day_bounds(study_date: Optional[str] = None, now: Optional[datetime] = None) -> Tuple[datetime, datetime, str]:
+    current = localized_now(LOCAL_TIMEZONE, now)
+    if study_date:
+        year, month, day = [int(part) for part in study_date.split("-")]
+        start = datetime(year, month, day, tzinfo=ZoneInfo(LOCAL_TIMEZONE))
+    else:
+        start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return start, end, start.date().isoformat()
+
+
+def hkt_period_label(value: Optional[str]) -> str:
+    if not value:
+        return "未分類"
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(ZoneInfo(LOCAL_TIMEZONE))
+    except ValueError:
+        return "未分類"
+    hour = dt.hour
+    if 0 <= hour < 8:
+        return "Overnight 00:00-08:00"
+    if 8 <= hour < 12:
+        return "Morning 08:00-12:00"
+    if 12 <= hour < 16:
+        return "Midday 12:00-16:00"
+    if 16 <= hour < 20:
+        return "US Pre-market/Open 16:00-20:00"
+    return "US Market 20:00-00:00"
+
+
+def build_daily_study_markdown(alerts: List[Dict[str, Any]], study_date: str) -> str:
+    lines = [
+        f"# Daily Market Study Brief - {study_date} HKT",
+        "",
+        f"Alerts archived: {len(alerts)}",
+    ]
+    if not alerts:
+        lines.append("\nNo archived Telegram alerts for this date yet.")
+        return "\n".join(lines)
+
+    by_period: Dict[str, List[Dict[str, Any]]] = {}
+    for alert in alerts:
+        by_period.setdefault(hkt_period_label(alert.get("period_start") or alert.get("created_at")), []).append(alert)
+
+    for period, items in by_period.items():
+        lines.extend(["", f"## {period}"])
+        for alert in items:
+            tickers = ", ".join(alert.get("tickers") or []) or "N/A"
+            sectors = ", ".join(alert.get("sectors") or []) or "N/A"
+            sources = alert.get("source_tweet_urls") or []
+            lines.extend([
+                "",
+                f"### {alert.get('title') or alert.get('alert_type')}",
+                f"- Type: {alert.get('alert_type')}",
+                f"- Impact max: {alert.get('impact_max') or 'N/A'}",
+                f"- Confidence avg: {alert.get('confidence_avg') or 'N/A'}",
+                f"- Tickers: {tickers}",
+                f"- Sectors: {sectors}",
+                "",
+                str(alert.get("message_markdown") or "").strip(),
+            ])
+            if sources:
+                lines.append("\nSources:")
+                lines.extend(f"- {url}" for url in sources[:12])
+    return "\n".join(lines).strip()
+
+
+def refresh_daily_study_brief(supabase: Client, now: Optional[datetime] = None) -> None:
+    if not ALERT_ARCHIVE_ENABLED:
+        return
+    start, end, study_date = hkt_day_bounds(now=now)
+    try:
+        response = (
+            supabase.table("telegram_alerts")
+            .select("id,alert_type,session_id,period_start,period_end,title,message_markdown,source_tweet_urls,impact_max,confidence_avg,tickers,sectors,created_at")
+            .gte("created_at", start.astimezone(timezone.utc).isoformat())
+            .lt("created_at", end.astimezone(timezone.utc).isoformat())
+            .order("created_at", desc=False)
+            .execute()
+        )
+        alerts = list(response.data or [])
+        tickers = sorted({ticker for alert in alerts for ticker in (alert.get("tickers") or [])})
+        sectors = sorted({sector for alert in alerts for sector in (alert.get("sectors") or [])})
+        urls = []
+        seen_urls = set()
+        for alert in alerts:
+            for url in alert.get("source_tweet_urls") or []:
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    urls.append(url)
+        row = {
+            "study_date": study_date,
+            "timezone": LOCAL_TIMEZONE,
+            "title": f"Daily Market Study Brief - {study_date} HKT",
+            "brief_markdown": build_daily_study_markdown(alerts, study_date),
+            "alert_ids": [int(alert["id"]) for alert in alerts if alert.get("id") is not None],
+            "tickers": tickers,
+            "sectors": sectors,
+            "source_tweet_urls": urls,
+            "alert_count": len(alerts),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table("daily_study_briefs").upsert(row, on_conflict="study_date").execute()
+    except Exception:
+        logger.warning("Daily study brief refresh skipped; archive tables may not exist yet", exc_info=True)
+
+
+def archive_telegram_alert(
+    supabase: Client,
+    alert_type: str,
+    title: str,
+    message_html: str,
+    session_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    refresh_study: bool = False,
+) -> None:
+    if not ALERT_ARCHIVE_ENABLED:
+        return
+    metadata = metadata or {}
+    row = {
+        "alert_type": alert_type,
+        "session_id": session_id,
+        "period_start": metadata.get("period_start"),
+        "period_end": metadata.get("period_end"),
+        "title": title,
+        "message_html": message_html,
+        "message_markdown": telegram_html_to_markdown(message_html),
+        "insight_ids": metadata.get("insight_ids") or [],
+        "source_tweet_urls": metadata.get("source_tweet_urls") or [],
+        "impact_max": metadata.get("impact_max"),
+        "confidence_avg": metadata.get("confidence_avg"),
+        "tickers": metadata.get("tickers") or [],
+        "sectors": metadata.get("sectors") or [],
+    }
+    try:
+        supabase.table("telegram_alerts").insert(row).execute()
+        if refresh_study:
+            refresh_daily_study_brief(supabase)
+    except Exception:
+        logger.warning("Telegram archive insert skipped; archive tables may not exist yet", exc_info=True)
+
+
 def build_overnight_digest_message(groups: List[List[Dict[str, Any]]], now: Optional[datetime] = None) -> str:
     current = localized_now(LOCAL_TIMEZONE, now)
     end = current.replace(hour=8, minute=0, second=0, microsecond=0)
@@ -581,15 +755,45 @@ def send_overnight_digest_if_due(supabase: Client, now: Optional[datetime] = Non
     rows = fetch_overnight_digest_rows(supabase, now)
     records = [row_to_group_record(row) for row in rows]
     if not records:
-        post_telegram_message(
-            f"<b>━━ Overnight Market Digest ━━</b>\n今日 HKT 00:00-08:00 暫時未有高衝擊訊號。",
-            disable_preview=True,
+        message = f"<b>━━ Overnight Market Digest ━━</b>\n今日 HKT 00:00-08:00 暫時未有高衝擊訊號。"
+        post_telegram_message(message, disable_preview=True)
+        archive_telegram_alert(
+            supabase,
+            "overnight_digest",
+            "Overnight Market Digest",
+            message,
+            session_id=f"digest-{today_key}",
+            metadata={
+                "period_start": (localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0) - timedelta(hours=DIGEST_LOOKBACK_HOURS)).astimezone(timezone.utc).isoformat(),
+                "period_end": localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat(),
+            },
+            refresh_study=True,
         )
         save_state_value(supabase, LAST_DIGEST_DATE_KEY, today_key)
         return
 
     groups = group_high_impact_records(records)
-    post_telegram_message(build_overnight_digest_message(groups, now), disable_preview=True)
+    message = build_overnight_digest_message(groups, now)
+    post_telegram_message(message, disable_preview=True)
+    metadata = {
+        "period_start": (localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0) - timedelta(hours=DIGEST_LOOKBACK_HOURS)).astimezone(timezone.utc).isoformat(),
+        "period_end": localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0).astimezone(timezone.utc).isoformat(),
+        "insight_ids": [str(row.get("tweet_id")) for row in rows if row.get("tweet_id")],
+        "source_tweet_urls": [str(row.get("tweet_url")) for row in rows if row.get("tweet_url")],
+        "impact_max": max((int(row.get("impact_score") or 0) for row in rows), default=0) or None,
+        "confidence_avg": round(sum(int(row.get("confidence_score") or 0) for row in rows) / len(rows), 2) if rows else None,
+        "tickers": sorted({str(ticker).upper() for row in rows for ticker in (row.get("affected_tickers") or []) if str(ticker).strip()}),
+        "sectors": sorted({str(sector) for row in rows for sector in (row.get("target_sectors") or []) if str(sector).strip()}),
+    }
+    archive_telegram_alert(
+        supabase,
+        "overnight_digest",
+        "Overnight Market Digest",
+        message,
+        session_id=f"digest-{today_key}",
+        metadata=metadata,
+        refresh_study=True,
+    )
     save_state_value(supabase, LAST_DIGEST_DATE_KEY, today_key)
     logger.info("Overnight digest sent date=%s rows=%s groups=%s", today_key, len(rows), len(groups))
 
@@ -864,8 +1068,17 @@ def post_telegram_message(message: str, disable_preview: bool = False) -> None:
         raise
 
 
-def send_telegram_session_header(count: int, group_count: int) -> None:
-    post_telegram_message(alert_session_title(count, group_count), disable_preview=True)
+def send_telegram_session_header(supabase: Client, count: int, group_count: int, session_id: str) -> None:
+    message = alert_session_title(count, group_count)
+    post_telegram_message(message, disable_preview=True)
+    archive_telegram_alert(
+        supabase,
+        "session_header",
+        "新一批市場訊號",
+        message,
+        session_id=session_id,
+        refresh_study=False,
+    )
 
 
 def signal_tokens(tweet: Dict[str, Any], insight: Dict[str, Any]) -> set[str]:
@@ -1028,10 +1241,12 @@ def synthesize_group_insight(client: OpenAI, group: List[Dict[str, Any]]) -> Dic
 
 
 def send_telegram_group_alert(
+    supabase: Client,
     group: List[Dict[str, Any]],
     merged: Dict[str, Any],
     index: int,
     total: int,
+    session_id: str,
     event_status: Optional[Dict[str, Any]] = None,
 ) -> None:
     score = int(merged["impact_score"])
@@ -1091,6 +1306,15 @@ def send_telegram_group_alert(
 {originals}
 """.strip()
     post_telegram_message(message, disable_preview=False)
+    archive_telegram_alert(
+        supabase,
+        "group_alert",
+        f"市場高優先級警報 {index}/{total}",
+        message,
+        session_id=session_id,
+        metadata=alert_metadata_from_group(group, merged),
+        refresh_study=False,
+    )
 
 
 def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
@@ -1146,7 +1370,7 @@ def evaluate_tweet(client: OpenAI, tweet: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
 
-def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
+def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any], supabase: Optional[Client] = None) -> None:
     score = int(insight["impact_score"])
     confidence = int(insight.get("confidence_score", 5))
     score_emoji = "🔥🔥🔥" if score >= 9 else "🔥🔥"
@@ -1184,6 +1408,16 @@ def send_telegram_alert(tweet: Dict[str, Any], insight: Dict[str, Any]) -> None:
 
     try:
         post_telegram_message(message, disable_preview=False)
+        if supabase is not None:
+            archive_telegram_alert(
+                supabase,
+                "single_alert",
+                "市場高優先級警報",
+                message,
+                session_id=f"single-{tweet['tweet_id']}",
+                metadata=alert_metadata_from_group([{"tweet": tweet, "insight": insight}], insight),
+                refresh_study=True,
+            )
     except Exception:
         logger.exception("Telegram alert failed for tweet_id=%s", tweet["tweet_id"])
         raise
@@ -1212,7 +1446,7 @@ def run_self_test(supabase: Client) -> None:
         "trading_action": "無需交易；呢條係測試訊號，可以驗證後喺 Supabase 刪除。",
         "risk_zh": "無市場風險。",
     }
-    send_telegram_alert(tweet, insight)
+    send_telegram_alert(tweet, insight, supabase)
     insert_insight(supabase, tweet, insight)
     logger.info("Self-test alert sent and inserted tweet_id=%s", tweet["tweet_id"])
 
@@ -1378,11 +1612,13 @@ def main() -> int:
                 groups = group_high_impact_records(telegram_records)
             logger.info("Sending %s Telegram-eligible high-impact records as %s groups", len(telegram_records), len(groups))
             if groups:
-                send_telegram_session_header(len(telegram_records), len(groups))
+                session_id = f"alerts-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+                send_telegram_session_header(supabase, len(telegram_records), len(groups), session_id)
                 merged_insights = [synthesize_group_insight(openai_client, group) for group in groups]
                 event_statuses = mark_event_status(groups, merged_insights, recent_events)
                 for index, (group, merged, event_status) in enumerate(zip(groups, merged_insights, event_statuses), start=1):
-                    send_telegram_group_alert(group, merged, index, len(groups), event_status)
+                    send_telegram_group_alert(supabase, group, merged, index, len(groups), session_id, event_status)
+                refresh_daily_study_brief(supabase)
         except Exception:
             return 1
 

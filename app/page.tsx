@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { getSupabaseServerClient } from "@/lib/supabase-server";
 
 export const dynamic = "force-dynamic";
@@ -129,7 +130,20 @@ export default async function DashboardPage() {
             </p>
           </div>
 
-          <div className="grid grid-cols-3 gap-2 text-right sm:min-w-[420px]">
+          <div className="flex flex-col gap-3 lg:items-end">
+            <nav className="flex flex-wrap gap-2 text-sm">
+              <Link className="border border-emerald-500/50 bg-emerald-950/30 px-3 py-2 text-emerald-100" href="/">
+                Signals
+              </Link>
+              <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href="/alerts">
+                Alerts
+              </Link>
+              <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href="/study">
+                Study
+              </Link>
+            </nav>
+
+            <div className="grid grid-cols-3 gap-2 text-right sm:min-w-[420px]">
             <div className="border border-zinc-800 bg-zinc-950/70 px-3 py-3">
               <p className="font-mono text-2xl font-semibold text-white">{insights.length}</p>
               <p className="mt-1 text-xs text-zinc-500">訊號數</p>
@@ -144,6 +158,7 @@ export default async function DashboardPage() {
               </p>
               <p className="mt-1 text-xs text-zinc-500">最新 Tweet</p>
             </div>
+          </div>
           </div>
         </header>
 
