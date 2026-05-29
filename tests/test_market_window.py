@@ -14,7 +14,7 @@ supabase_stub.Client = object
 supabase_stub.create_client = lambda *_args, **_kwargs: object()
 sys.modules.setdefault("supabase", supabase_stub)
 
-from crawler import current_x_fetch_limit, is_hkt_quiet_window, should_run_market_window, should_run_tier2, should_run_truth_social, should_send_overnight_digest
+from crawler import cap_new_tweets_for_run, current_x_fetch_limit, is_hkt_quiet_window, should_run_market_window, should_run_tier2, should_run_truth_social, should_send_overnight_digest
 
 
 def ny_time(hour: int, minute: int) -> datetime:
@@ -75,6 +75,13 @@ class MarketWindowTest(unittest.TestCase):
         self.assertTrue(should_send_overnight_digest(hkt_time(8, 7)))
         self.assertFalse(should_send_overnight_digest(hkt_time(8, 22)))
         self.assertFalse(should_send_overnight_digest(hkt_time(7, 7)))
+
+    def test_caps_backlog_to_newest_tweets(self) -> None:
+        tweets = [{"tweet_id": str(index)} for index in range(20)]
+
+        capped = cap_new_tweets_for_run(tweets, limit=5)
+
+        self.assertEqual([tweet["tweet_id"] for tweet in capped], ["15", "16", "17", "18", "19"])
 
     def test_bypass_market_window(self) -> None:
         os.environ["BYPASS_MARKET_WINDOW"] = "true"

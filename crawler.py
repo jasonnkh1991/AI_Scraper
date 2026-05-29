@@ -31,6 +31,9 @@ LAST_DIGEST_DATE_KEY = "last_overnight_digest_date"
 ALERT_ARCHIVE_ENABLED = os.getenv("ALERT_ARCHIVE_ENABLED", "true").lower() in {"1", "true", "yes"}
 STUDY_ALERT_TYPES = ["group_alert", "single_alert", "study_only_signal"]
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
+MAX_NEW_TWEETS_PER_RUN = int(os.getenv("MAX_NEW_TWEETS_PER_RUN", "12"))
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "25"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
 EVENT_MEMORY_HOURS = int(os.getenv("EVENT_MEMORY_HOURS", "6"))
 MAX_TRACKED_EVENTS = int(os.getenv("MAX_TRACKED_EVENTS", "300"))
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
@@ -360,6 +363,12 @@ def should_run_market_window(now: Optional[datetime] = None) -> bool:
     if 0 <= hour < 6:
         return minute in {7, 37}
     return False
+
+
+def cap_new_tweets_for_run(tweets: List[Dict[str, Any]], limit: int = MAX_NEW_TWEETS_PER_RUN) -> List[Dict[str, Any]]:
+    if limit <= 0 or len(tweets) <= limit:
+        return tweets
+    return tweets[-limit:]
 
 
 def get_supabase() -> Client:
@@ -1594,6 +1603,8 @@ def main() -> int:
         openai_client = OpenAI(
             api_key=require_env("OPENAI_API_KEY"),
             base_url=os.getenv("OPENAI_BASE_URL") or None,
+            timeout=OPENAI_TIMEOUT_SECONDS,
+            max_retries=OPENAI_MAX_RETRIES,
         )
         last_processed_id = fetch_last_processed_tweet_id(supabase)
         raw_tweets = fetch_tweets_from_apify()
@@ -1634,6 +1645,15 @@ def main() -> int:
             len(processed_tweet_ids),
         )
         return 0
+
+    backlog_count = len(new_tweets)
+    if backlog_count > MAX_NEW_TWEETS_PER_RUN:
+        new_tweets = cap_new_tweets_for_run(new_tweets)
+        logger.warning(
+            "Backlog has %s unseen tweets; processing newest %s this run to stay inside timeout",
+            backlog_count,
+            len(new_tweets),
+        )
 
     logger.info("Processing %s new tweets", len(new_tweets))
     fully_processed = True
