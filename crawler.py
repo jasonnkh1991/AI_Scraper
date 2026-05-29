@@ -18,9 +18,16 @@ APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", os.getenv("TIER1_FETCH_LIMIT", "40")))
 TIER2_FETCH_LIMIT = int(os.getenv("TIER2_FETCH_LIMIT", "20"))
 OVERNIGHT_FETCH_LIMIT = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "10"))
+QUIET_FETCH_LIMIT = int(os.getenv("QUIET_FETCH_LIMIT", "30"))
+QUIET_IMMEDIATE_IMPACT_SCORE = int(os.getenv("QUIET_IMMEDIATE_IMPACT_SCORE", "9"))
+QUIET_IMMEDIATE_CONFIDENCE_SCORE = int(os.getenv("QUIET_IMMEDIATE_CONFIDENCE_SCORE", "8"))
+DIGEST_LOOKBACK_HOURS = int(os.getenv("DIGEST_LOOKBACK_HOURS", "8"))
+MAX_DIGEST_EVENTS = int(os.getenv("MAX_DIGEST_EVENTS", "6"))
+LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "Asia/Hong_Kong")
 STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
 RECENT_EVENT_FINGERPRINTS_KEY = "recent_event_fingerprints"
+LAST_DIGEST_DATE_KEY = "last_overnight_digest_date"
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
 EVENT_MEMORY_HOURS = int(os.getenv("EVENT_MEMORY_HOURS", "6"))
 MAX_TRACKED_EVENTS = int(os.getenv("MAX_TRACKED_EVENTS", "300"))
@@ -257,14 +264,36 @@ def normalize_truth_post(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def localized_now(timezone_name: str, now: Optional[datetime] = None) -> datetime:
+    timezone_obj = ZoneInfo(timezone_name)
+    current = now or datetime.now(timezone_obj)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone_obj)
+    return current.astimezone(timezone_obj)
+
+
+def is_hkt_quiet_window(now: Optional[datetime] = None) -> bool:
+    current = localized_now(LOCAL_TIMEZONE, now)
+    return 0 <= current.hour < 8
+
+
+def should_send_overnight_digest(now: Optional[datetime] = None) -> bool:
+    if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
+        return False
+    current = localized_now(LOCAL_TIMEZONE, now)
+    return current.hour == 8 and current.minute == 7
+
+
 def is_overnight_window(now: Optional[datetime] = None) -> bool:
-    current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
+    current = localized_now(MARKET_TIMEZONE, now)
     return 0 <= current.hour < 6
 
 
 def current_x_fetch_limit(now: Optional[datetime] = None) -> int:
     if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
         return FETCH_LIMIT
+    if is_hkt_quiet_window(now):
+        return QUIET_FETCH_LIMIT
     return OVERNIGHT_FETCH_LIMIT if is_overnight_window(now) else FETCH_LIMIT
 
 
@@ -272,8 +301,8 @@ def should_run_tier2(now: Optional[datetime] = None) -> bool:
     if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
         return True
 
-    current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
-    if is_overnight_window(current):
+    current = localized_now(MARKET_TIMEZONE, now)
+    if is_hkt_quiet_window(now) or is_overnight_window(current):
         return False
     if not should_run_market_window(current):
         return False
@@ -298,8 +327,8 @@ def should_run_truth_social(now: Optional[datetime] = None) -> bool:
     if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
         return True
 
-    current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
-    if is_overnight_window(current):
+    current = localized_now(MARKET_TIMEZONE, now)
+    if is_hkt_quiet_window(now) or is_overnight_window(current):
         return False
     if not should_run_market_window(current):
         return False
@@ -314,7 +343,11 @@ def should_run_market_window(now: Optional[datetime] = None) -> bool:
     if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
         return True
 
-    current = now or datetime.now(ZoneInfo(MARKET_TIMEZONE))
+    if is_hkt_quiet_window(now):
+        current_hkt = localized_now(LOCAL_TIMEZONE, now)
+        return current_hkt.minute == 7
+
+    current = localized_now(MARKET_TIMEZONE, now)
     hour = current.hour
     minute = current.minute
 
@@ -429,6 +462,136 @@ def save_last_processed_tweet_id(supabase: Client, tweet_id: str) -> None:
     except Exception:
         logger.exception("Failed to save state to Supabase")
         raise
+
+
+def digest_date_key(now: Optional[datetime] = None) -> str:
+    return localized_now(LOCAL_TIMEZONE, now).date().isoformat()
+
+
+def fetch_overnight_digest_rows(supabase: Client, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    end = localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=DIGEST_LOOKBACK_HOURS)
+    try:
+        response = (
+            supabase.table("insights")
+            .select(
+                "tweet_id,author_handle,author_name,tweet_text,tweet_url,tweet_created_at,impact_score,"
+                "target_sectors,summary_zh,trading_action,original_zh,why_it_matters_zh,"
+                "market_mechanism_zh,affected_tickers,confidence_score,time_horizon,source_quality,risk_zh,inserted_at"
+            )
+            .gte("inserted_at", start.astimezone(timezone.utc).isoformat())
+            .lt("inserted_at", end.astimezone(timezone.utc).isoformat())
+            .order("impact_score", desc=True)
+            .limit(80)
+            .execute()
+        )
+        return list(response.data or [])
+    except Exception:
+        logger.exception("Failed to fetch overnight digest rows")
+        raise
+
+
+def row_to_group_record(row: Dict[str, Any]) -> Dict[str, Any]:
+    tweet = {
+        "tweet_id": str(row.get("tweet_id") or ""),
+        "tweet_text": str(row.get("tweet_text") or ""),
+        "author_handle": str(row.get("author_handle") or "unknown"),
+        "author_name": str(row.get("author_name") or row.get("author_handle") or "unknown"),
+        "tweet_url": str(row.get("tweet_url") or ""),
+        "tweet_created_at": row.get("tweet_created_at"),
+    }
+    insight = {
+        "impact_score": int(row.get("impact_score") or 1),
+        "confidence_score": int(row.get("confidence_score") or 5),
+        "source_quality": row.get("source_quality") or "unknown",
+        "time_horizon": row.get("time_horizon") or "unclear",
+        "target_sectors": row.get("target_sectors") or [],
+        "affected_tickers": row.get("affected_tickers") or [],
+        "summary_zh": row.get("summary_zh") or "",
+        "original_zh": row.get("original_zh") or row.get("tweet_text") or "",
+        "why_it_matters_zh": row.get("why_it_matters_zh") or "",
+        "market_mechanism_zh": row.get("market_mechanism_zh") or "",
+        "trading_action": row.get("trading_action") or "",
+        "risk_zh": row.get("risk_zh") or "",
+    }
+    return {"tweet": tweet, "insight": insight}
+
+
+def format_digest_source_links(group: List[Dict[str, Any]]) -> str:
+    links = []
+    for item in group[:3]:
+        handle = html.escape(item["tweet"]["author_handle"])
+        url = html.escape(item["tweet"].get("tweet_url") or "")
+        if url:
+            links.append(f'<a href="{url}">@{handle}</a>')
+        else:
+            links.append(f"@{handle}")
+    if len(group) > 3:
+        links.append(f"+{len(group) - 3}")
+    return " / ".join(links)
+
+
+def build_overnight_digest_message(groups: List[List[Dict[str, Any]]], now: Optional[datetime] = None) -> str:
+    current = localized_now(LOCAL_TIMEZONE, now)
+    end = current.replace(hour=8, minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=DIGEST_LOOKBACK_HOURS)
+    ranked = sorted(
+        groups,
+        key=lambda group: (
+            max(int(item["insight"].get("impact_score", 0)) for item in group),
+            max(int(item["insight"].get("confidence_score", 0)) for item in group),
+            len(group),
+        ),
+        reverse=True,
+    )[:MAX_DIGEST_EVENTS]
+
+    lines = [
+        "<b>━━ Overnight Market Digest ━━</b>",
+        f"<b>時段：</b>{html.escape(start.strftime('%Y-%m-%d %H:%M'))}-{html.escape(end.strftime('%H:%M'))} HKT",
+        f"<b>整合事件：</b>{len(ranked)} / <b>原始訊號：</b>{sum(len(group) for group in groups)}",
+    ]
+
+    for idx, group in enumerate(ranked, start=1):
+        merged = merge_group_insight(group)
+        tickers = ", ".join(merged.get("affected_tickers") or ["未能直接映射"])
+        sectors = ", ".join(merged.get("target_sectors") or ["未分類"])
+        lines.extend([
+            "",
+            f"<b>{idx}. {html.escape(truncate_text(merged.get('summary_zh', ''), 120))}</b>",
+            f"Impact {int(merged.get('impact_score', 0))}/10 · Confidence {int(merged.get('confidence_score', 0))}/10 · {html.escape(str(merged.get('time_horizon', 'unclear')))}",
+            f"Ticker：{html.escape(tickers)}",
+            f"板塊：{html.escape(sectors)}",
+            f"重點：{html.escape(truncate_text(merged.get('why_it_matters_zh') or merged.get('market_mechanism_zh') or merged.get('trading_action'), 180))}",
+            f"交易觀察：{html.escape(truncate_text(merged.get('trading_action', ''), 160))}",
+            f"來源：{format_digest_source_links(group)}",
+        ])
+
+    return "\n".join(lines)
+
+
+def send_overnight_digest_if_due(supabase: Client, now: Optional[datetime] = None) -> None:
+    if not should_send_overnight_digest(now):
+        return
+
+    today_key = digest_date_key(now)
+    if fetch_state_value(supabase, LAST_DIGEST_DATE_KEY) == today_key:
+        logger.info("Overnight digest already sent for %s", today_key)
+        return
+
+    rows = fetch_overnight_digest_rows(supabase, now)
+    records = [row_to_group_record(row) for row in rows]
+    if not records:
+        post_telegram_message(
+            f"<b>━━ Overnight Market Digest ━━</b>\n今日 HKT 00:00-08:00 暫時未有高衝擊訊號。",
+            disable_preview=True,
+        )
+        save_state_value(supabase, LAST_DIGEST_DATE_KEY, today_key)
+        return
+
+    groups = group_high_impact_records(records)
+    post_telegram_message(build_overnight_digest_message(groups, now), disable_preview=True)
+    save_state_value(supabase, LAST_DIGEST_DATE_KEY, today_key)
+    logger.info("Overnight digest sent date=%s rows=%s groups=%s", today_key, len(rows), len(groups))
 
 
 def extract_apify_run_id(response_text: str) -> Optional[str]:
@@ -1120,6 +1283,7 @@ def main() -> int:
         supabase = get_supabase()
         processed_tweet_ids = fetch_processed_tweet_ids(supabase)
         recent_events = fetch_recent_event_fingerprints(supabase)
+        send_overnight_digest_if_due(supabase)
         if os.getenv("SELF_TEST_MODE", "").lower() in {"1", "true", "yes"}:
             run_self_test(supabase)
             return 0
@@ -1199,13 +1363,26 @@ def main() -> int:
 
     if fully_processed and high_impact_records:
         try:
-            groups = group_high_impact_records(high_impact_records)
-            logger.info("Sending %s high-impact records as %s Telegram groups", len(high_impact_records), len(groups))
-            send_telegram_session_header(len(high_impact_records), len(groups))
-            merged_insights = [synthesize_group_insight(openai_client, group) for group in groups]
-            event_statuses = mark_event_status(groups, merged_insights, recent_events)
-            for index, (group, merged, event_status) in enumerate(zip(groups, merged_insights, event_statuses), start=1):
-                send_telegram_group_alert(group, merged, index, len(groups), event_status)
+            telegram_records = [
+                record for record in high_impact_records
+                if not is_hkt_quiet_window()
+                or (
+                    int(record["insight"].get("impact_score", 0)) >= QUIET_IMMEDIATE_IMPACT_SCORE
+                    and int(record["insight"].get("confidence_score", 0)) >= QUIET_IMMEDIATE_CONFIDENCE_SCORE
+                )
+            ]
+            if not telegram_records:
+                logger.info("Quiet mode suppressed %s high-impact Telegram alerts", len(high_impact_records))
+                groups = []
+            else:
+                groups = group_high_impact_records(telegram_records)
+            logger.info("Sending %s Telegram-eligible high-impact records as %s groups", len(telegram_records), len(groups))
+            if groups:
+                send_telegram_session_header(len(telegram_records), len(groups))
+                merged_insights = [synthesize_group_insight(openai_client, group) for group in groups]
+                event_statuses = mark_event_status(groups, merged_insights, recent_events)
+                for index, (group, merged, event_status) in enumerate(zip(groups, merged_insights, event_statuses), start=1):
+                    send_telegram_group_alert(group, merged, index, len(groups), event_status)
         except Exception:
             return 1
 

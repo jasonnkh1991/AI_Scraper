@@ -78,6 +78,15 @@ class AlertGroupingTest(unittest.TestCase):
         self.assertEqual(statuses[0]["previous_seen_at"], "2026-05-29T01:00:00+00:00")
         self.assertIn("tickers:SNOW", recent)
 
+    def test_digest_message_includes_source_links(self) -> None:
+        group = [record("1", "Snowflake AWS AI compute deal", ["SNOW", "AMZN"])]
+        message = crawler.build_overnight_digest_message([group])
+
+        self.assertIn("Overnight Market Digest", message)
+        self.assertIn("來源：", message)
+        self.assertIn("https://x.com/source/status/1", message)
+        self.assertIn("@source", message)
+
 
 if __name__ == "__main__":
     unittest.main()
