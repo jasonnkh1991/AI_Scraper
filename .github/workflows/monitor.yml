@@ -17,22 +17,22 @@ on:
         description: "Tier 1 X.com fetch limit during NY 06:00-24:00"
         required: false
         type: string
-        default: "40"
+        default: "60"
       tier2_fetch_limit:
         description: "Tier 2 X.com fetch limit for hourly runs"
         required: false
         type: string
-        default: "20"
+        default: "15"
       overnight_fetch_limit:
         description: "Tier 1 X.com fetch limit during NY 00:00-06:00"
         required: false
         type: string
         default: "10"
-      max_new_tweets_per_run:
-        description: "Maximum unseen tweets to evaluate with AI per run"
+      ai_process_limit:
+        description: "Maximum queued tweets to evaluate with AI per run"
         required: false
         type: string
-        default: "12"
+        default: "15"
       truth_social_enabled:
         description: "Enable Truth Social crawling"
         required: false
@@ -95,12 +95,13 @@ jobs:
           TIER2_TWITTER_SEARCH_QUERY: ${{ secrets.TIER2_TWITTER_SEARCH_QUERY }}
           APIFY_ACTOR_ID: pzMmk1t7AZ8OKJhfU
           SELF_TEST_MODE: ${{ inputs.self_test }}
-          FETCH_LIMIT: ${{ inputs.tier1_fetch_limit || '40' }}
-          TIER2_FETCH_LIMIT: ${{ inputs.tier2_fetch_limit || '20' }}
+          FETCH_LIMIT: ${{ inputs.tier1_fetch_limit || '60' }}
+          TIER2_FETCH_LIMIT: ${{ inputs.tier2_fetch_limit || '15' }}
           OVERNIGHT_FETCH_LIMIT: ${{ inputs.overnight_fetch_limit || '10' }}
-          MAX_NEW_TWEETS_PER_RUN: ${{ inputs.max_new_tweets_per_run || '12' }}
-          OPENAI_TIMEOUT_SECONDS: "25"
-          OPENAI_MAX_RETRIES: "1"
+          AI_PROCESS_LIMIT: ${{ inputs.ai_process_limit || '15' }}
+          MAX_NEW_TWEETS_PER_RUN: ${{ inputs.ai_process_limit || '15' }}
+          OPENAI_TIMEOUT_SECONDS: "20"
+          OPENAI_MAX_RETRIES: "0"
           BYPASS_MARKET_WINDOW: ${{ inputs.bypass_market_window }}
           TRUTH_SOCIAL_ENABLED: ${{ inputs.truth_social_enabled || false }}
           TRUTH_SOCIAL_ACTOR_ID: IWIOv7oeNxfcjTnX5

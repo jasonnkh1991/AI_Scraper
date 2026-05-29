@@ -15,8 +15,8 @@ from supabase import Client, create_client
 
 APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "pzMmk1t7AZ8OKJhfU")
 APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
-FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", os.getenv("TIER1_FETCH_LIMIT", "40")))
-TIER2_FETCH_LIMIT = int(os.getenv("TIER2_FETCH_LIMIT", "20"))
+FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", os.getenv("TIER1_FETCH_LIMIT", "60")))
+TIER2_FETCH_LIMIT = int(os.getenv("TIER2_FETCH_LIMIT", "15"))
 OVERNIGHT_FETCH_LIMIT = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "10"))
 QUIET_FETCH_LIMIT = int(os.getenv("QUIET_FETCH_LIMIT", "30"))
 QUIET_IMMEDIATE_IMPACT_SCORE = int(os.getenv("QUIET_IMMEDIATE_IMPACT_SCORE", "9"))
@@ -31,9 +31,12 @@ LAST_DIGEST_DATE_KEY = "last_overnight_digest_date"
 ALERT_ARCHIVE_ENABLED = os.getenv("ALERT_ARCHIVE_ENABLED", "true").lower() in {"1", "true", "yes"}
 STUDY_ALERT_TYPES = ["group_alert", "single_alert", "study_only_signal"]
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
-MAX_NEW_TWEETS_PER_RUN = int(os.getenv("MAX_NEW_TWEETS_PER_RUN", "12"))
-OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "25"))
-OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+AI_PROCESS_LIMIT = int(os.getenv("AI_PROCESS_LIMIT", os.getenv("MAX_NEW_TWEETS_PER_RUN", "15")))
+MAX_NEW_TWEETS_PER_RUN = AI_PROCESS_LIMIT
+QUEUE_MAX_ATTEMPTS = int(os.getenv("QUEUE_MAX_ATTEMPTS", "2"))
+MAX_AI_FAILURES_PER_RUN = int(os.getenv("MAX_AI_FAILURES_PER_RUN", "3"))
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "20"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "0"))
 EVENT_MEMORY_HOURS = int(os.getenv("EVENT_MEMORY_HOURS", "6"))
 MAX_TRACKED_EVENTS = int(os.getenv("MAX_TRACKED_EVENTS", "300"))
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
@@ -365,10 +368,24 @@ def should_run_market_window(now: Optional[datetime] = None) -> bool:
     return False
 
 
-def cap_new_tweets_for_run(tweets: List[Dict[str, Any]], limit: int = MAX_NEW_TWEETS_PER_RUN) -> List[Dict[str, Any]]:
+def cap_new_tweets_for_run(tweets: List[Dict[str, Any]], limit: int = AI_PROCESS_LIMIT) -> List[Dict[str, Any]]:
     if limit <= 0 or len(tweets) <= limit:
         return tweets
-    return tweets[-limit:]
+    return tweets[:limit]
+
+
+def queued_row_to_tweet(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "tweet_id": str(row["tweet_id"]),
+        "tweet_id_int": tweet_id_to_int(str(row.get("tweet_id") or row.get("tweet_id_int") or "0")),
+        "author_handle": str(row.get("author_handle") or "unknown"),
+        "author_name": str(row.get("author_name") or row.get("author_handle") or "unknown"),
+        "tweet_text": str(row.get("tweet_text") or ""),
+        "tweet_url": str(row.get("tweet_url") or ""),
+        "tweet_created_at": row.get("tweet_created_at"),
+        "author_followers": row.get("author_followers"),
+        "source": row.get("source") or "x",
+    }
 
 
 def get_supabase() -> Client:
@@ -473,6 +490,109 @@ def save_last_processed_tweet_id(supabase: Client, tweet_id: str) -> None:
     except Exception:
         logger.exception("Failed to save state to Supabase")
         raise
+
+
+def enqueue_tweets(supabase: Client, tweets: List[Dict[str, Any]]) -> int:
+    if not tweets:
+        return 0
+
+    rows = []
+    for tweet in tweets:
+        rows.append({
+            "tweet_id": tweet["tweet_id"],
+            "tweet_id_int": tweet.get("tweet_id_int") or tweet_id_to_int(tweet.get("tweet_id")),
+            "author_handle": tweet.get("author_handle") or "unknown",
+            "author_name": tweet.get("author_name") or tweet.get("author_handle") or "unknown",
+            "tweet_text": tweet.get("tweet_text") or "",
+            "tweet_url": tweet.get("tweet_url") or "",
+            "tweet_created_at": tweet.get("tweet_created_at"),
+            "author_followers": tweet.get("author_followers"),
+            "source": tweet.get("source") or "x",
+            "status": "pending",
+        })
+
+    try:
+        supabase.table("tweet_queue").upsert(
+            rows,
+            on_conflict="tweet_id",
+            ignore_duplicates=True,
+        ).execute()
+        logger.info("Queued %s fetched tweets with duplicate protection", len(rows))
+        return len(rows)
+    except Exception:
+        logger.exception("Failed to enqueue tweets into Supabase tweet_queue")
+        raise
+
+
+def fetch_pending_queue_tweets(supabase: Client, limit: int = AI_PROCESS_LIMIT) -> List[Dict[str, Any]]:
+    try:
+        response = (
+            supabase.table("tweet_queue")
+            .select("tweet_id,tweet_id_int,author_handle,author_name,tweet_text,tweet_url,tweet_created_at,author_followers,source,attempts")
+            .eq("status", "pending")
+            .lt("attempts", QUEUE_MAX_ATTEMPTS)
+            .order("tweet_id_int", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        rows = list(response.data or [])
+        logger.info("Loaded %s pending tweets from queue for AI processing limit=%s", len(rows), limit)
+        return rows
+    except Exception:
+        logger.exception("Failed to fetch pending tweets from Supabase tweet_queue")
+        raise
+
+
+def mark_queue_processed(supabase: Client, tweet_id: str) -> None:
+    try:
+        supabase.table("tweet_queue").update({
+            "status": "processed",
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "last_error": None,
+        }).eq("tweet_id", tweet_id).execute()
+    except Exception:
+        logger.exception("Failed to mark queued tweet processed tweet_id=%s", tweet_id)
+        raise
+
+
+def mark_queue_failed(supabase: Client, row: Dict[str, Any], error: Exception) -> None:
+    attempts = int(row.get("attempts") or 0) + 1
+    status = "failed" if attempts >= QUEUE_MAX_ATTEMPTS else "pending"
+    message = str(error)[:1000]
+    try:
+        supabase.table("tweet_queue").update({
+            "status": status,
+            "attempts": attempts,
+            "last_error": message,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("tweet_id", str(row["tweet_id"])).execute()
+        logger.warning(
+            "Marked queued tweet tweet_id=%s status=%s attempts=%s error=%s",
+            row["tweet_id"],
+            status,
+            attempts,
+            message,
+        )
+    except Exception:
+        logger.exception("Failed to mark queued tweet failed tweet_id=%s", row.get("tweet_id"))
+        raise
+
+
+def fetch_queue_backlog_count(supabase: Client) -> int:
+    try:
+        response = (
+            supabase.table("tweet_queue")
+            .select("tweet_id", count="exact")
+            .eq("status", "pending")
+            .lt("attempts", QUEUE_MAX_ATTEMPTS)
+            .limit(1)
+            .execute()
+        )
+        return int(response.count or 0)
+    except Exception:
+        logger.exception("Failed to count pending tweet_queue rows")
+        return -1
 
 
 def digest_date_key(now: Optional[datetime] = None) -> str:
@@ -1636,31 +1756,32 @@ def main() -> int:
             tweet.get("tweet_created_at"),
         )
     tweets.sort(key=lambda tweet: tweet["tweet_id_int"])
-    new_tweets = [tweet for tweet in tweets if tweet["tweet_id"] not in processed_tweet_ids]
+    enqueue_tweets(supabase, tweets)
+    queue_backlog_count = fetch_queue_backlog_count(supabase)
+    queued_rows = fetch_pending_queue_tweets(supabase, AI_PROCESS_LIMIT)
 
-    if not new_tweets:
+    if not queued_rows:
         logger.info(
-            "No unseen tweets. last_processed_tweet_id=%s tracked_seen_ids=%s",
+            "No queued tweets pending AI. last_processed_tweet_id=%s tracked_seen_ids=%s queue_backlog=%s",
             last_processed_id,
             len(processed_tweet_ids),
+            queue_backlog_count,
         )
         return 0
 
-    backlog_count = len(new_tweets)
-    if backlog_count > MAX_NEW_TWEETS_PER_RUN:
-        new_tweets = cap_new_tweets_for_run(new_tweets)
-        logger.warning(
-            "Backlog has %s unseen tweets; processing newest %s this run to stay inside timeout",
-            backlog_count,
-            len(new_tweets),
-        )
-
-    logger.info("Processing %s new tweets", len(new_tweets))
+    logger.info(
+        "Processing %s queued tweets with AI_PROCESS_LIMIT=%s queue_backlog_before=%s",
+        len(queued_rows),
+        AI_PROCESS_LIMIT,
+        queue_backlog_count,
+    )
     fully_processed = True
     latest_processed_tweet_id = str(last_processed_id)
     high_impact_records: List[Dict[str, Any]] = []
+    ai_failure_count = 0
 
-    for tweet in new_tweets:
+    for row in queued_rows:
+        tweet = queued_row_to_tweet(row)
         try:
             insight = evaluate_tweet(openai_client, tweet)
             if insight["has_market_impact"] and insight["impact_score"] >= 7:
@@ -1673,14 +1794,19 @@ def main() -> int:
                 )
             else:
                 logger.info("Skipped low-impact tweet_id=%s", tweet["tweet_id"])
+            mark_queue_processed(supabase, tweet["tweet_id"])
             latest_processed_tweet_id = tweet["tweet_id"]
             processed_tweet_ids.add(tweet["tweet_id"])
-        except Exception:
+        except Exception as error:
+            ai_failure_count += 1
             fully_processed = False
-            logger.exception("Stopped before advancing state past tweet_id=%s", tweet["tweet_id"])
-            break
+            mark_queue_failed(supabase, row, error)
+            logger.exception("AI processing failed for queued tweet_id=%s", tweet["tweet_id"])
+            if ai_failure_count >= MAX_AI_FAILURES_PER_RUN:
+                logger.error("Stopping AI loop after %s failures in one run", ai_failure_count)
+                break
 
-    if fully_processed and high_impact_records:
+    if high_impact_records:
         try:
             quiet_mode = is_hkt_quiet_window()
             telegram_records = [
@@ -1723,22 +1849,23 @@ def main() -> int:
         except Exception:
             return 1
 
-    if fully_processed:
-        try:
-            save_last_processed_tweet_id(supabase, latest_processed_tweet_id)
-            save_processed_tweet_ids(supabase, processed_tweet_ids)
-            save_recent_event_fingerprints(supabase, recent_events)
-            logger.info(
-                "Saved %s=%s tracked_seen_ids=%s tracked_events=%s",
-                STATE_KEY,
-                latest_processed_tweet_id,
-                len(processed_tweet_ids),
-                len(recent_events),
-            )
-        except Exception:
-            return 1
-    else:
-        logger.warning("Batch incomplete; state was not advanced.")
+    try:
+        save_last_processed_tweet_id(supabase, latest_processed_tweet_id)
+        save_processed_tweet_ids(supabase, processed_tweet_ids)
+        save_recent_event_fingerprints(supabase, recent_events)
+        logger.info(
+            "Saved %s=%s tracked_seen_ids=%s tracked_events=%s queue_backlog_after=%s",
+            STATE_KEY,
+            latest_processed_tweet_id,
+            len(processed_tweet_ids),
+            len(recent_events),
+            fetch_queue_backlog_count(supabase),
+        )
+    except Exception:
+        return 1
+
+    if not fully_processed:
+        logger.warning("Batch had %s AI failures; queued rows were retained or marked failed by attempts.", ai_failure_count)
         return 1
 
     return 0

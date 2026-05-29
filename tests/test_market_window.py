@@ -76,12 +76,12 @@ class MarketWindowTest(unittest.TestCase):
         self.assertFalse(should_send_overnight_digest(hkt_time(8, 22)))
         self.assertFalse(should_send_overnight_digest(hkt_time(7, 7)))
 
-    def test_caps_backlog_to_newest_tweets(self) -> None:
+    def test_caps_backlog_to_oldest_tweets_for_queue_drain(self) -> None:
         tweets = [{"tweet_id": str(index)} for index in range(20)]
 
         capped = cap_new_tweets_for_run(tweets, limit=5)
 
-        self.assertEqual([tweet["tweet_id"] for tweet in capped], ["15", "16", "17", "18", "19"])
+        self.assertEqual([tweet["tweet_id"] for tweet in capped], ["0", "1", "2", "3", "4"])
 
     def test_bypass_market_window(self) -> None:
         os.environ["BYPASS_MARKET_WINDOW"] = "true"
