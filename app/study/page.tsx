@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { CopyMarkdownButton } from "./CopyMarkdownButton";
 import { getSupabaseServerClient } from "@/lib/supabase-server";
 
 export const dynamic = "force-dynamic";
@@ -194,11 +195,17 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
             </p>
           </aside>
 
-          <textarea
-            className="min-h-[720px] w-full resize-y border border-zinc-800 bg-black/40 p-4 font-mono text-sm leading-6 text-zinc-100 outline-none"
-            readOnly
-            value={markdown}
-          />
+          <div className="min-w-0 border border-zinc-800 bg-black/40">
+            <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+              <p className="font-mono text-xs uppercase text-zinc-500">Markdown Export</p>
+              <CopyMarkdownButton value={markdown} />
+            </div>
+            <textarea
+              className="min-h-[720px] w-full resize-y bg-transparent p-4 font-mono text-sm leading-6 text-zinc-100 outline-none"
+              readOnly
+              value={markdown}
+            />
+          </div>
         </section>
       </div>
     </main>
