@@ -29,6 +29,7 @@ PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
 RECENT_EVENT_FINGERPRINTS_KEY = "recent_event_fingerprints"
 LAST_DIGEST_DATE_KEY = "last_overnight_digest_date"
 ALERT_ARCHIVE_ENABLED = os.getenv("ALERT_ARCHIVE_ENABLED", "true").lower() in {"1", "true", "yes"}
+STUDY_ALERT_TYPES = ["group_alert", "single_alert", "study_only_signal"]
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
 EVENT_MEMORY_HOURS = int(os.getenv("EVENT_MEMORY_HOURS", "6"))
 MAX_TRACKED_EVENTS = int(os.getenv("MAX_TRACKED_EVENTS", "300"))
@@ -638,6 +639,7 @@ def refresh_daily_study_brief(supabase: Client, now: Optional[datetime] = None) 
         response = (
             supabase.table("telegram_alerts")
             .select("id,alert_type,session_id,period_start,period_end,title,message_markdown,source_tweet_urls,impact_max,confidence_avg,tickers,sectors,created_at")
+            .in_("alert_type", STUDY_ALERT_TYPES)
             .gte("created_at", start.astimezone(timezone.utc).isoformat())
             .lt("created_at", end.astimezone(timezone.utc).isoformat())
             .order("created_at", desc=False)
@@ -703,6 +705,69 @@ def archive_telegram_alert(
             refresh_daily_study_brief(supabase)
     except Exception:
         logger.warning("Telegram archive insert skipped; archive tables may not exist yet", exc_info=True)
+
+
+def build_study_only_signal_message(
+    group: List[Dict[str, Any]],
+    merged: Dict[str, Any],
+    index: int,
+    total: int,
+) -> str:
+    sources = " / ".join(f"@{item['tweet']['author_handle']}" for item in group[:6])
+    if len(group) > 6:
+        sources += f" / +{len(group) - 6}"
+    sectors = ", ".join(merged.get("target_sectors") or ["未分類"])
+    tickers = ", ".join(merged.get("affected_tickers") or ["未能直接映射"])
+    source_links = "\n".join(
+        f'- <a href="{html.escape(item["tweet"]["tweet_url"])}">@{html.escape(item["tweet"]["author_handle"])}</a>'
+        for item in group[:8]
+    )
+    return f"""
+<b>Study-only 市場訊號 {index}/{total}</b>
+<b>狀態：</b>Quiet Mode 已收錄，未即時 Telegram
+<b>整合：</b>{len(group)} 條相近 post
+<b>來源：</b>{html.escape(sources)}
+<b>Impact：</b>{int(merged.get('impact_score', 0))}/10 · <b>Confidence：</b>{int(merged.get('confidence_score', 0))}/10
+<b>Source：</b>{html.escape(str(merged.get('source_quality', 'unknown')))} · <b>時窗：</b>{html.escape(str(merged.get('time_horizon', 'unclear')))}
+<b>板塊：</b>{html.escape(sectors)}
+<b>Ticker：</b>{html.escape(tickers)}
+
+<b>整合重點：</b>
+{html.escape(truncate_text(merged.get('summary_zh', ''), 700))}
+
+<b>點解重要：</b>
+{html.escape(truncate_text(merged.get('why_it_matters_zh', ''), 700))}
+
+<b>影響鏈：</b>
+{html.escape(truncate_text(merged.get('market_mechanism_zh', ''), 700))}
+
+<b>交易觀察：</b>
+{html.escape(truncate_text(merged.get('trading_action', ''), 500))}
+
+<b>反面風險：</b>
+{html.escape(truncate_text(merged.get('risk_zh', ''), 500))}
+
+<b>Sources：</b>
+{source_links}
+""".strip()
+
+
+def archive_study_only_signals(
+    supabase: Client,
+    groups: List[List[Dict[str, Any]]],
+    merged_insights: List[Dict[str, Any]],
+    session_id: str,
+) -> None:
+    for index, (group, merged) in enumerate(zip(groups, merged_insights), start=1):
+        archive_telegram_alert(
+            supabase,
+            "study_only_signal",
+            f"Study-only 市場訊號 {index}/{len(groups)}",
+            build_study_only_signal_message(group, merged, index, len(groups)),
+            session_id=session_id,
+            metadata=alert_metadata_from_group(group, merged),
+            refresh_study=False,
+        )
 
 
 def build_overnight_digest_message(groups: List[List[Dict[str, Any]]], now: Optional[datetime] = None) -> str:
@@ -1597,14 +1662,30 @@ def main() -> int:
 
     if fully_processed and high_impact_records:
         try:
+            quiet_mode = is_hkt_quiet_window()
             telegram_records = [
                 record for record in high_impact_records
-                if not is_hkt_quiet_window()
+                if not quiet_mode
                 or (
                     int(record["insight"].get("impact_score", 0)) >= QUIET_IMMEDIATE_IMPACT_SCORE
                     and int(record["insight"].get("confidence_score", 0)) >= QUIET_IMMEDIATE_CONFIDENCE_SCORE
                 )
             ]
+            telegram_tweet_ids = {record["tweet"]["tweet_id"] for record in telegram_records}
+            study_only_records = [
+                record for record in high_impact_records
+                if quiet_mode and record["tweet"]["tweet_id"] not in telegram_tweet_ids
+            ]
+            session_id = f"alerts-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+            if study_only_records:
+                study_groups = group_high_impact_records(study_only_records)
+                study_merged = [synthesize_group_insight(openai_client, group) for group in study_groups]
+                archive_study_only_signals(supabase, study_groups, study_merged, session_id)
+                logger.info(
+                    "Quiet mode archived %s high-impact records as %s study-only groups",
+                    len(study_only_records),
+                    len(study_groups),
+                )
             if not telegram_records:
                 logger.info("Quiet mode suppressed %s high-impact Telegram alerts", len(high_impact_records))
                 groups = []
@@ -1612,12 +1693,12 @@ def main() -> int:
                 groups = group_high_impact_records(telegram_records)
             logger.info("Sending %s Telegram-eligible high-impact records as %s groups", len(telegram_records), len(groups))
             if groups:
-                session_id = f"alerts-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
                 send_telegram_session_header(supabase, len(telegram_records), len(groups), session_id)
                 merged_insights = [synthesize_group_insight(openai_client, group) for group in groups]
                 event_statuses = mark_event_status(groups, merged_insights, recent_events)
                 for index, (group, merged, event_status) in enumerate(zip(groups, merged_insights, event_statuses), start=1):
                     send_telegram_group_alert(supabase, group, merged, index, len(groups), session_id, event_status)
+            if groups or study_only_records:
                 refresh_daily_study_brief(supabase)
         except Exception:
             return 1

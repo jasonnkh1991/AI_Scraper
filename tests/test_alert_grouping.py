@@ -118,6 +118,16 @@ class AlertGroupingTest(unittest.TestCase):
         self.assertIn("SNOW signs AI deal", markdown)
         self.assertIn("https://x.com/source/status/1", markdown)
 
+    def test_study_only_signal_message_marks_quiet_mode(self) -> None:
+        group = [record("1", "Snowflake AWS AI compute deal", ["SNOW", "AMZN"])]
+        merged = crawler.merge_group_insight(group)
+
+        message = crawler.build_study_only_signal_message(group, merged, 1, 1)
+
+        self.assertIn("Study-only 市場訊號", message)
+        self.assertIn("Quiet Mode 已收錄", message)
+        self.assertIn("https://x.com/source/status/1", message)
+
 
 if __name__ == "__main__":
     unittest.main()

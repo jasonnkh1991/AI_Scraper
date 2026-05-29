@@ -19,6 +19,8 @@ type StudyBrief = {
   updated_at: string;
 };
 
+const STUDY_ALERT_TYPES = ["group_alert", "single_alert", "study_only_signal"];
+
 type TelegramAlert = {
   id: number;
   alert_type: string;
@@ -113,6 +115,7 @@ async function getStudy(date: string): Promise<{ brief: StudyBrief | null; fallb
   const { data: alertsData, error } = await supabase
     .from("telegram_alerts")
     .select("id,alert_type,title,message_markdown,source_tweet_urls,impact_max,confidence_avg,tickers,sectors,period_start,created_at")
+    .in("alert_type", STUDY_ALERT_TYPES)
     .gte("created_at", start)
     .lt("created_at", end)
     .order("created_at", { ascending: true });
@@ -129,10 +132,10 @@ async function getStudy(date: string): Promise<{ brief: StudyBrief | null; fallb
 export default async function StudyPage({ searchParams }: { searchParams: SearchParams }) {
   const params = await searchParams;
   const selectedDate = params.date || hktDateString();
-  const { brief, fallback, alerts } = await getStudy(selectedDate);
-  const markdown = brief?.brief_markdown || fallback;
-  const tickers = brief?.tickers ?? Array.from(new Set(alerts.flatMap((alert) => alert.tickers ?? [])));
-  const sectors = brief?.sectors ?? Array.from(new Set(alerts.flatMap((alert) => alert.sectors ?? [])));
+  const { fallback, alerts } = await getStudy(selectedDate);
+  const markdown = fallback;
+  const tickers = Array.from(new Set(alerts.flatMap((alert) => alert.tickers ?? [])));
+  const sectors = Array.from(new Set(alerts.flatMap((alert) => alert.sectors ?? [])));
 
   return (
     <main className="min-h-screen bg-[#05070a] text-zinc-100">
@@ -162,7 +165,7 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
           </form>
           <div className="grid grid-cols-3 gap-2 text-right">
             <div className="border border-zinc-800 bg-black/20 px-3 py-2">
-              <p className="font-mono text-xl font-semibold text-white">{brief?.alert_count ?? alerts.length}</p>
+              <p className="font-mono text-xl font-semibold text-white">{alerts.length}</p>
               <p className="text-xs text-zinc-500">Alerts</p>
             </div>
             <div className="border border-zinc-800 bg-black/20 px-3 py-2">
@@ -191,7 +194,7 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
               </div>
             </div>
             <p className="text-xs leading-5 text-zinc-500">
-              呢個 textarea 已經係 AI-ready 格式。全選複製後，可以直接叫 AI 分析今日主線、可交易 catalyst、風險同 next watchlist。
+              呢個 textarea 已排除 session header 同 08:00 digest，只保留原始研究訊號。撳 Copy Markdown 後可以直接交俾 AI 做復盤。
             </p>
           </aside>
 
