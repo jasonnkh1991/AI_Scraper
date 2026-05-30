@@ -94,6 +94,7 @@ jobs:
           TIER1_TWITTER_SEARCH_QUERY: ${{ secrets.TIER1_TWITTER_SEARCH_QUERY }}
           TIER2_TWITTER_SEARCH_QUERY: ${{ secrets.TIER2_TWITTER_SEARCH_QUERY }}
           APIFY_ACTOR_ID: pzMmk1t7AZ8OKJhfU
+          APIFY_TIMEOUT_SECONDS: "90"
           SELF_TEST_MODE: ${{ inputs.self_test }}
           FETCH_LIMIT: ${{ inputs.tier1_fetch_limit || '60' }}
           TIER2_FETCH_LIMIT: ${{ inputs.tier2_fetch_limit || '15' }}

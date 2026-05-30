@@ -14,7 +14,7 @@ from supabase import Client, create_client
 
 
 APIFY_ACTOR_ID = os.getenv("APIFY_ACTOR_ID", "pzMmk1t7AZ8OKJhfU")
-APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "180"))
+APIFY_TIMEOUT_SECONDS = int(os.getenv("APIFY_TIMEOUT_SECONDS", "90"))
 FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", os.getenv("TIER1_FETCH_LIMIT", "60")))
 TIER2_FETCH_LIMIT = int(os.getenv("TIER2_FETCH_LIMIT", "15"))
 OVERNIGHT_FETCH_LIMIT = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "10"))
@@ -1727,13 +1727,18 @@ def main() -> int:
             max_retries=OPENAI_MAX_RETRIES,
         )
         last_processed_id = fetch_last_processed_tweet_id(supabase)
-        raw_tweets = fetch_tweets_from_apify()
+        raw_tweets: List[Dict[str, Any]] = []
+        try:
+            raw_tweets = fetch_tweets_from_apify()
+        except Exception:
+            logger.exception("X Apify fetch failed; continuing with existing Supabase queue only.")
+
         raw_truth_posts: List[Dict[str, Any]] = []
         if should_run_truth_social():
             try:
                 raw_truth_posts = fetch_truth_posts_from_apify()
             except Exception:
-                logger.exception("Truth Social fetch failed; continuing with X source only.")
+                logger.exception("Truth Social fetch failed; continuing with X source/queue only.")
         elif TRUTH_SOCIAL_ENABLED:
             logger.info("Truth Social fetch skipped for this run.")
     except Exception:
