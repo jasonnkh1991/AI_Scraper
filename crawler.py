@@ -38,6 +38,11 @@ PRIORITY_AI_PROCESS_LIMIT = int(os.getenv("PRIORITY_AI_PROCESS_LIMIT", "25"))
 NORMAL_AI_PROCESS_LIMIT = int(os.getenv("NORMAL_AI_PROCESS_LIMIT", "10"))
 STALE_PENDING_HOURS = int(os.getenv("STALE_PENDING_HOURS", "18"))
 STALE_PRIORITY_KEEP_SCORE = int(os.getenv("STALE_PRIORITY_KEEP_SCORE", "40"))
+DYNAMIC_WATCH_TERMS_ENABLED = os.getenv("DYNAMIC_WATCH_TERMS_ENABLED", "true").lower() in {"1", "true", "yes"}
+DYNAMIC_WATCH_TERM_TTL_HOURS = int(os.getenv("DYNAMIC_WATCH_TERM_TTL_HOURS", "168"))
+DYNAMIC_WATCH_TERM_LIMIT = int(os.getenv("DYNAMIC_WATCH_TERM_LIMIT", "80"))
+DYNAMIC_WATCH_TERM_MAX_BONUS = int(os.getenv("DYNAMIC_WATCH_TERM_MAX_BONUS", "25"))
+DYNAMIC_WATCH_TOTAL_MAX_BONUS = int(os.getenv("DYNAMIC_WATCH_TOTAL_MAX_BONUS", "45"))
 QUEUE_PROCESSED_RETENTION_DAYS = int(os.getenv("QUEUE_PROCESSED_RETENTION_DAYS", "7"))
 QUEUE_STALE_RETENTION_DAYS = int(os.getenv("QUEUE_STALE_RETENTION_DAYS", "3"))
 QUEUE_FAILED_RETENTION_DAYS = int(os.getenv("QUEUE_FAILED_RETENTION_DAYS", "14"))
@@ -49,6 +54,7 @@ LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "Asia/Hong_Kong")
 STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
 RECENT_EVENT_FINGERPRINTS_KEY = "recent_event_fingerprints"
+DYNAMIC_WATCH_TERMS_KEY = "dynamic_watch_terms"
 LAST_DIGEST_DATE_KEY = "last_overnight_digest_date"
 LAST_POWER_HOUR_DIGEST_DATE_KEY = "last_power_hour_digest_date"
 LAST_PREMARKET_DIGEST_DATE_KEY = "last_premarket_digest_date"
@@ -533,6 +539,256 @@ def save_recent_event_fingerprints(supabase: Client, fingerprints: Dict[str, str
         raise
 
 
+
+DYNAMIC_TERM_STOPWORDS = {
+    "US", "USA", "U.S", "United States", "White House", "President", "Market", "Markets",
+    "Breaking", "Update", "Source", "Sources", "Report", "Reports", "News", "The", "This",
+    "Bank", "Company", "Companies", "Shares", "Stock", "Stocks", "AI", "CEO", "CFO",
+    "Fed", "FOMC", "Treasury", "China", "Japan", "Europe", "Monday", "Tuesday",
+    "Wednesday", "Thursday", "Friday", "Saturday", "Sunday", "Today", "Tomorrow",
+}
+
+DYNAMIC_TERM_TITLE_RE = re.compile(
+    r"\b[A-Z][A-Za-z0-9&.-]{2,}"
+    r"(?:\s+(?:[A-Z][A-Za-z0-9&.-]{2,}|[A-Z]{2,}|[0-9][A-Za-z0-9.-]*)){0,3}\b"
+)
+DYNAMIC_TERM_PRODUCT_RE = re.compile(
+    r"\b(?:GB\d{2,4}|B\d{2,4}|MI\d{3,4}|H\d{2,4}|RTX\d{2,4}|Vera Rubin|Rubin Ultra|Blackwell Ultra|Stargate|xAI|Grok\s?\d*)\b",
+    re.IGNORECASE,
+)
+DYNAMIC_TERM_CONTEXT_RE = re.compile(
+    r"\b(nominated|confirmed|candidate|successor|replaces|named|appoints|picked|names|launches|unveils|deal|contract|stake|13f|13g|guidance|export control|sanction|tariff)\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_dynamic_term(term: Any) -> Optional[str]:
+    cleaned = re.sub(r"\s+", " ", str(term or "").strip(" @#$.,:;()[]{}<>\"'`"))
+    cleaned = cleaned.replace("’", "'")
+    if not cleaned or len(cleaned) < 3 or len(cleaned) > 60:
+        return None
+    if cleaned.upper() in {item.upper() for item in DYNAMIC_TERM_STOPWORDS}:
+        return None
+    if cleaned.lower() in {item.lower() for item in DYNAMIC_TERM_STOPWORDS}:
+        return None
+    if cleaned.isdigit():
+        return None
+    if re.fullmatch(r"[A-Z]{1,2}", cleaned):
+        return None
+    return cleaned
+
+
+def dynamic_term_key(term: str) -> str:
+    return re.sub(r"\s+", " ", term.strip().lower())
+
+
+def dynamic_term_is_active(entry: Dict[str, Any], now: Optional[datetime] = None) -> bool:
+    if not DYNAMIC_WATCH_TERMS_ENABLED:
+        return False
+    current = now or datetime.now(timezone.utc)
+    try:
+        last_seen = datetime.fromisoformat(str(entry.get("last_seen_at", "")).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return last_seen.astimezone(timezone.utc) >= current - timedelta(hours=DYNAMIC_WATCH_TERM_TTL_HOURS)
+
+
+def fetch_dynamic_watch_terms(supabase: Client) -> Dict[str, Dict[str, Any]]:
+    if not DYNAMIC_WATCH_TERMS_ENABLED:
+        return {}
+    try:
+        value = fetch_state_value(supabase, DYNAMIC_WATCH_TERMS_KEY)
+        if not value:
+            return {}
+        data = json.loads(value)
+        if not isinstance(data, dict):
+            return {}
+        active = {
+            str(key): entry
+            for key, entry in data.items()
+            if isinstance(entry, dict) and dynamic_term_is_active(entry)
+        }
+        logger.info("Loaded %s active dynamic watch terms", len(active))
+        return active
+    except Exception:
+        logger.exception("Failed to fetch dynamic watch terms")
+        return {}
+
+
+def save_dynamic_watch_terms(supabase: Client, terms: Dict[str, Dict[str, Any]]) -> None:
+    if not DYNAMIC_WATCH_TERMS_ENABLED:
+        return
+    active_items = [
+        (key, entry)
+        for key, entry in terms.items()
+        if dynamic_term_is_active(entry)
+    ]
+    active_items.sort(
+        key=lambda item: (
+            int(item[1].get("score") or 0),
+            int(item[1].get("hits") or 0),
+            str(item[1].get("last_seen_at") or ""),
+        ),
+        reverse=True,
+    )
+    payload = dict(active_items[:DYNAMIC_WATCH_TERM_LIMIT])
+    save_state_value(supabase, DYNAMIC_WATCH_TERMS_KEY, json.dumps(payload, ensure_ascii=False))
+    logger.info("Saved %s dynamic watch terms", len(payload))
+
+
+def extract_dynamic_terms_from_text(text: Any) -> List[str]:
+    source = str(text or "")
+    candidates: List[str] = []
+    candidates.extend(match.group(0) for match in DYNAMIC_TERM_PRODUCT_RE.finditer(source))
+    candidates.extend(match.group(1) for match in re.finditer(r"\$([A-Z]{2,6})\b", source))
+    candidates.extend(match.group(0) for match in DYNAMIC_TERM_TITLE_RE.finditer(source))
+
+    if DYNAMIC_TERM_CONTEXT_RE.search(source):
+        for match in re.finditer(
+            r"\b(?:nominated|candidate|successor|named|names|appoints|picked|stake in|position in|deal with|contract with)\s+([A-Z][A-Za-z.-]{2,}(?:\s+[A-Z][A-Za-z.-]{2,}){0,3})",
+            source,
+            flags=re.IGNORECASE,
+        ):
+            candidates.append(match.group(1))
+
+    normalized: List[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        term = normalize_dynamic_term(candidate)
+        if not term:
+            continue
+        key = dynamic_term_key(term)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(term)
+    return normalized[:16]
+
+
+def should_learn_dynamic_terms_from_tweet(tweet: Dict[str, Any]) -> bool:
+    handle = str(tweet.get("author_handle") or "").lstrip("@")
+    if SOURCE_PRIORITY.get(handle, 0) >= 15:
+        return True
+    text = str(tweet.get("tweet_text") or "")
+    return bool(DYNAMIC_TERM_CONTEXT_RE.search(text))
+
+
+def merge_dynamic_watch_terms(
+    terms: Dict[str, Dict[str, Any]],
+    candidates: List[str],
+    source: str,
+    score: int,
+    reason: str,
+) -> Tuple[Dict[str, Dict[str, Any]], int]:
+    if not DYNAMIC_WATCH_TERMS_ENABLED:
+        return terms, 0
+    now_iso = datetime.now(timezone.utc).isoformat()
+    changed = 0
+    for candidate in candidates:
+        term = normalize_dynamic_term(candidate)
+        if not term:
+            continue
+        key = dynamic_term_key(term)
+        existing = terms.get(key, {})
+        sources = unique_ordered((existing.get("sources") or []) + [source])[:8]
+        reasons = unique_ordered((existing.get("reasons") or []) + [reason])[:8]
+        terms[key] = {
+            "term": existing.get("term") or term,
+            "score": max(int(existing.get("score") or 0), score),
+            "hits": int(existing.get("hits") or 0) + 1,
+            "sources": sources,
+            "reasons": reasons,
+            "first_seen_at": existing.get("first_seen_at") or now_iso,
+            "last_seen_at": now_iso,
+        }
+        changed += 1
+    return terms, changed
+
+
+def learn_dynamic_terms_from_tweets(
+    supabase: Client,
+    terms: Dict[str, Dict[str, Any]],
+    tweets: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    changed_total = 0
+    for tweet in tweets:
+        if not should_learn_dynamic_terms_from_tweet(tweet):
+            continue
+        candidates = extract_dynamic_terms_from_text(tweet.get("tweet_text"))
+        if not candidates:
+            continue
+        terms, changed = merge_dynamic_watch_terms(
+            terms,
+            candidates,
+            source=f"@{tweet.get('author_handle', 'unknown')}",
+            score=12,
+            reason="source_or_context_fetch",
+        )
+        changed_total += changed
+    if changed_total:
+        save_dynamic_watch_terms(supabase, terms)
+        logger.info("Learned %s dynamic watch term hits from fetched tweets", changed_total)
+    return terms
+
+
+def learn_dynamic_terms_from_records(
+    supabase: Client,
+    terms: Dict[str, Dict[str, Any]],
+    records: List[Dict[str, Any]],
+    merged_insights: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    changed_total = 0
+    for record in records:
+        tweet = record.get("tweet") or {}
+        insight = record.get("insight") or {}
+        impact = int(insight.get("impact_score") or 0)
+        confidence = int(insight.get("confidence_score") or 0)
+        if impact < 7 or confidence < 5:
+            continue
+        text = " ".join([
+            str(tweet.get("tweet_text") or ""),
+            str(insight.get("summary_zh") or ""),
+            str(insight.get("why_it_matters_zh") or ""),
+            str(insight.get("market_mechanism_zh") or ""),
+            " ".join(insight.get("affected_tickers") or []),
+        ])
+        candidates = extract_dynamic_terms_from_text(text)
+        terms, changed = merge_dynamic_watch_terms(
+            terms,
+            candidates,
+            source=f"AI:{tweet.get('author_handle', 'unknown')}",
+            score=18 if impact >= 8 else 14,
+            reason=f"ai_high_impact:{impact}:confidence:{confidence}",
+        )
+        changed_total += changed
+
+    for insight in merged_insights or []:
+        impact = int(insight.get("impact_score") or 0)
+        confidence = int(insight.get("confidence_score") or 0)
+        if impact < 7 or confidence < 5:
+            continue
+        text = " ".join([
+            str(insight.get("summary_zh") or ""),
+            str(insight.get("why_it_matters_zh") or ""),
+            str(insight.get("market_mechanism_zh") or ""),
+            str(insight.get("trading_action") or ""),
+            " ".join(insight.get("affected_tickers") or []),
+        ])
+        terms, changed = merge_dynamic_watch_terms(
+            terms,
+            extract_dynamic_terms_from_text(text),
+            source="AI:cluster",
+            score=20 if impact >= 8 else 15,
+            reason=f"cluster:{impact}:confidence:{confidence}",
+        )
+        changed_total += changed
+
+    if changed_total:
+        save_dynamic_watch_terms(supabase, terms)
+        logger.info("Learned %s dynamic watch term hits from AI records/clusters", changed_total)
+    return terms
+
+
 def fetch_last_processed_tweet_id(supabase: Client) -> int:
     try:
         value = fetch_state_value(supabase, STATE_KEY)
@@ -601,7 +857,7 @@ def tweet_age_minutes(tweet: Dict[str, Any]) -> Optional[float]:
     return (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds() / 60
 
 
-def calculate_priority(tweet: Dict[str, Any]) -> Tuple[int, List[str]]:
+def calculate_priority(tweet: Dict[str, Any], dynamic_terms: Optional[Dict[str, Dict[str, Any]]] = None) -> Tuple[int, List[str]]:
     handle = str(tweet.get("author_handle") or "")
     text = f"{handle} {tweet.get('author_name') or ''} {tweet.get('tweet_text') or ''}".lower()
     score = 0
@@ -625,6 +881,25 @@ def calculate_priority(tweet: Dict[str, Any]) -> Tuple[int, List[str]]:
         score += 8
         reasons.append("market:has_number:8")
 
+    dynamic_bonus = 0
+    if DYNAMIC_WATCH_TERMS_ENABLED and dynamic_terms:
+        tweet_text_lower = str(tweet.get("tweet_text") or "").lower()
+        for key, entry in dynamic_terms.items():
+            term = str(entry.get("term") or key).strip()
+            if not term or not dynamic_term_is_active(entry):
+                continue
+            if dynamic_term_key(term) not in tweet_text_lower:
+                continue
+            points = min(int(entry.get("score") or 0), DYNAMIC_WATCH_TERM_MAX_BONUS)
+            if points <= 0:
+                continue
+            dynamic_bonus += points
+            reasons.append(f"dynamic:{truncate_text(term, 32)}:{points}")
+            if dynamic_bonus >= DYNAMIC_WATCH_TOTAL_MAX_BONUS:
+                dynamic_bonus = DYNAMIC_WATCH_TOTAL_MAX_BONUS
+                break
+        score += dynamic_bonus
+
     age = tweet_age_minutes(tweet)
     if age is not None:
         if age < 30:
@@ -643,13 +918,13 @@ def calculate_priority(tweet: Dict[str, Any]) -> Tuple[int, List[str]]:
     return max(score, 0), reasons[:16]
 
 
-def enqueue_tweets(supabase: Client, tweets: List[Dict[str, Any]]) -> int:
+def enqueue_tweets(supabase: Client, tweets: List[Dict[str, Any]], dynamic_terms: Optional[Dict[str, Dict[str, Any]]] = None) -> int:
     if not tweets:
         return 0
 
     rows = []
     for tweet in tweets:
-        priority_score, priority_reason = calculate_priority(tweet)
+        priority_score, priority_reason = calculate_priority(tweet, dynamic_terms)
         rows.append({
             "tweet_id": tweet["tweet_id"],
             "tweet_id_int": tweet.get("tweet_id_int") or tweet_id_to_int(tweet.get("tweet_id")),
@@ -2467,6 +2742,7 @@ def main() -> int:
     try:
         supabase = get_supabase()
         cleanup_old_records(supabase)
+        dynamic_watch_terms = fetch_dynamic_watch_terms(supabase)
         processed_tweet_ids = fetch_processed_tweet_ids(supabase)
         recent_events = fetch_recent_event_fingerprints(supabase)
         send_overnight_digest_if_due(supabase)
@@ -2522,7 +2798,8 @@ def main() -> int:
             tweet.get("tweet_created_at"),
         )
     tweets.sort(key=lambda tweet: tweet["tweet_id_int"])
-    enqueue_tweets(supabase, tweets)
+    dynamic_watch_terms = learn_dynamic_terms_from_tweets(supabase, dynamic_watch_terms, tweets)
+    enqueue_tweets(supabase, tweets, dynamic_watch_terms)
     stale_count = mark_stale_pending_tweets(supabase)
     queue_backlog_count = fetch_queue_backlog_count(supabase)
     queued_rows = fetch_pending_queue_tweets(supabase)
@@ -2577,6 +2854,7 @@ def main() -> int:
         try:
             all_groups = group_high_impact_records(high_impact_records)
             all_merged = [synthesize_group_insight(openai_client, group) for group in all_groups]
+            dynamic_watch_terms = learn_dynamic_terms_from_records(supabase, dynamic_watch_terms, high_impact_records, all_merged)
             for group, merged in zip(all_groups, all_merged):
                 upsert_event_cluster(supabase, group, merged)
 

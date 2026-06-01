@@ -217,6 +217,36 @@ class AlertGroupingTest(unittest.TestCase):
         self.assertIn("Vera Rubin", message)
 
 
+    def test_dynamic_watch_terms_extract_new_candidate_name(self) -> None:
+        terms = crawler.extract_dynamic_terms_from_text(
+            "Trump names Kevin Hassett as a possible Federal Reserve chair successor after Powell."
+        )
+
+        self.assertIn("Kevin Hassett", terms)
+
+    def test_dynamic_watch_terms_boost_priority(self) -> None:
+        active_terms = {
+            "helios alpha": {
+                "term": "Helios Alpha",
+                "score": 20,
+                "hits": 2,
+                "sources": ["AI:cluster"],
+                "reasons": ["cluster:8:confidence:7"],
+                "first_seen_at": "2026-06-01T00:00:00+00:00",
+                "last_seen_at": crawler.datetime.now(crawler.timezone.utc).isoformat(),
+            }
+        }
+
+        score, reasons = crawler.calculate_priority({
+            "author_handle": "unknown",
+            "author_name": "Unknown",
+            "tweet_text": "Helios Alpha wins a new AI infrastructure contract.",
+            "tweet_created_at": crawler.datetime.now(crawler.timezone.utc).isoformat(),
+        }, active_terms)
+
+        self.assertGreaterEqual(score, 40)
+        self.assertTrue(any(reason.startswith("dynamic:Helios Alpha") for reason in reasons))
+
     def test_cleanup_old_records_uses_safe_filters(self) -> None:
         class FakeResponse:
             data = []
