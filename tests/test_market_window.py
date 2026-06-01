@@ -14,7 +14,7 @@ supabase_stub.Client = object
 supabase_stub.create_client = lambda *_args, **_kwargs: object()
 sys.modules.setdefault("supabase", supabase_stub)
 
-from crawler import cap_new_tweets_for_run, current_x_fetch_limit, is_hkt_quiet_window, should_run_market_window, should_run_tier2, should_run_truth_social, should_send_overnight_digest, should_send_power_hour_digest
+from crawler import cap_new_tweets_for_run, current_x_fetch_limit, is_hkt_quiet_window, should_run_market_window, should_run_tier2, should_run_truth_social, should_send_market_open_digest, should_send_overnight_digest, should_send_power_hour_digest, should_send_premarket_digest
 
 
 def ny_time(hour: int, minute: int) -> datetime:
@@ -80,6 +80,16 @@ class MarketWindowTest(unittest.TestCase):
         self.assertFalse(should_send_power_hour_digest(hkt_time(2, 22)))
         self.assertTrue(should_send_power_hour_digest(hkt_time(2, 37)))
         self.assertFalse(should_send_power_hour_digest(hkt_time(2, 52)))
+
+    def test_premarket_digest_runs_after_hkt_2030(self) -> None:
+        self.assertFalse(should_send_premarket_digest(hkt_time(20, 22)))
+        self.assertTrue(should_send_premarket_digest(hkt_time(20, 37)))
+        self.assertFalse(should_send_premarket_digest(hkt_time(20, 52)))
+
+    def test_market_open_digest_runs_after_hkt_2315(self) -> None:
+        self.assertFalse(should_send_market_open_digest(hkt_time(23, 7)))
+        self.assertTrue(should_send_market_open_digest(hkt_time(23, 22)))
+        self.assertFalse(should_send_market_open_digest(hkt_time(23, 37)))
 
     def test_caps_backlog_to_oldest_tweets_for_queue_drain(self) -> None:
         tweets = [{"tweet_id": str(index)} for index in range(20)]

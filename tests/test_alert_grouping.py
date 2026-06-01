@@ -140,6 +140,50 @@ class AlertGroupingTest(unittest.TestCase):
         self.assertIn("Midday / Power Hour Prep", message)
         self.assertIn("來源：", message)
 
+    def test_event_cluster_payload_merges_sources(self) -> None:
+        group = [
+            record("1", "Snowflake AWS AI compute deal", ["SNOW", "AMZN"]),
+            record("2", "AWS signs AI infrastructure agreement", ["AMZN"]),
+        ]
+        merged = crawler.merge_group_insight(group)
+        payload = crawler.event_cluster_payload(group, merged, "tickers:AMZN,SNOW")
+
+        self.assertEqual(payload["fingerprint"], "tickers:AMZN,SNOW")
+        self.assertEqual(payload["source_count"], 2)
+        self.assertEqual(payload["tickers"], ["AMZN", "SNOW"])
+        self.assertEqual(payload["tweet_ids"], ["1", "2"])
+
+    def test_cluster_rows_render_as_digest_groups(self) -> None:
+        rows = [{
+            "id": 10,
+            "fingerprint": "tickers:SNOW",
+            "title": "SNOW AI deal",
+            "summary_zh": "Snowflake 簽下 AI 基建合作",
+            "why_it_matters_zh": "雲端 AI demand 被強化",
+            "market_mechanism_zh": "提升 GPU/CPU 需求預期",
+            "trading_action": "留意 SNOW、AMZN、NVDA",
+            "risk_zh": "估值已高",
+            "impact_max": 8,
+            "confidence_avg": 7,
+            "confidence_max": 7,
+            "source_quality": "reputable_media",
+            "time_horizon": "days",
+            "tickers": ["SNOW"],
+            "sectors": ["AI Infrastructure"],
+            "tweet_ids": ["1"],
+            "source_handles": ["@source"],
+            "source_tweet_urls": ["https://x.com/source/status/1"],
+            "source_count": 1,
+            "last_seen_at": "2026-05-29T01:00:00+00:00",
+        }]
+
+        groups = crawler.cluster_rows_to_groups(rows)
+        message = crawler.build_premarket_digest_message(groups)
+
+        self.assertIn("Pre-Market Brief", message)
+        self.assertIn("SNOW", message)
+        self.assertIn("https://x.com/source/status/1", message)
+
 
 if __name__ == "__main__":
     unittest.main()

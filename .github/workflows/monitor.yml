@@ -107,6 +107,8 @@ jobs:
           IMMEDIATE_ALERT_MIN_CONFIDENCE: "7"
           CRITICAL_ALERT_IMPACT_SCORE: "9"
           POWER_HOUR_DIGEST_LOOKBACK_HOURS: "6"
+          PREMARKET_DIGEST_LOOKBACK_HOURS: "12"
+          MARKET_OPEN_DIGEST_LOOKBACK_HOURS: "3"
           BYPASS_MARKET_WINDOW: ${{ inputs.bypass_market_window }}
           TRUTH_SOCIAL_ENABLED: ${{ inputs.truth_social_enabled || false }}
           TRUTH_SOCIAL_ACTOR_ID: IWIOv7oeNxfcjTnX5

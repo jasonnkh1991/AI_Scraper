@@ -7,32 +7,29 @@ export const revalidate = 0;
 
 type SearchParams = Promise<{ date?: string }>;
 
-type StudyBrief = {
-  study_date: string;
-  timezone: string;
-  title: string;
-  brief_markdown: string;
-  alert_count: number;
-  tickers: string[] | null;
-  sectors: string[] | null;
-  source_tweet_urls: string[] | null;
-  updated_at: string;
-};
-
-const STUDY_ALERT_TYPES = ["group_alert", "single_alert", "study_only_signal"];
-
-type TelegramAlert = {
+type EventCluster = {
   id: number;
-  alert_type: string;
+  fingerprint: string;
   title: string;
-  message_markdown: string;
-  source_tweet_urls: string[] | null;
-  impact_max: number | null;
+  summary_zh: string;
+  why_it_matters_zh: string | null;
+  market_mechanism_zh: string | null;
+  trading_action: string | null;
+  risk_zh: string | null;
+  impact_max: number;
   confidence_avg: number | null;
+  confidence_max: number | null;
+  source_quality: string | null;
+  time_horizon: string | null;
   tickers: string[] | null;
   sectors: string[] | null;
-  period_start: string | null;
-  created_at: string;
+  tweet_ids: string[] | null;
+  source_handles: string[] | null;
+  source_tweet_urls: string[] | null;
+  source_count: number;
+  first_seen_at: string;
+  last_seen_at: string;
+  last_tweet_created_at: string | null;
 };
 
 function hktDateString(date = new Date()) {
@@ -48,6 +45,16 @@ function dateBounds(date: string) {
   const start = new Date(`${date}T00:00:00+08:00`);
   const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
   return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function hktTime(value: string | null) {
+  if (!value) return "時間未知";
+  return new Intl.DateTimeFormat("zh-HK", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "Asia/Hong_Kong",
+  }).format(new Date(value));
 }
 
 function periodLabel(value: string | null) {
@@ -66,35 +73,52 @@ function periodLabel(value: string | null) {
   return "US Market 20:00-00:00";
 }
 
-function fallbackBrief(date: string, alerts: TelegramAlert[]) {
-  const lines = [`# Daily Market Study Brief - ${date} HKT`, "", `Alerts archived: ${alerts.length}`];
-  const grouped = alerts.reduce<Record<string, TelegramAlert[]>>((acc, alert) => {
-    const label = periodLabel(alert.period_start || alert.created_at);
+function uniq(values: string[]) {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function buildMarkdown(date: string, clusters: EventCluster[]) {
+  const lines = [`# Daily Market Study Brief - ${date} HKT`, "", `Event clusters: ${clusters.length}`];
+  const grouped = clusters.reduce<Record<string, EventCluster[]>>((acc, cluster) => {
+    const label = periodLabel(cluster.last_seen_at || cluster.first_seen_at);
     acc[label] = acc[label] || [];
-    acc[label].push(alert);
+    acc[label].push(cluster);
     return acc;
   }, {});
 
-  if (alerts.length === 0) {
-    lines.push("", "No archived Telegram alerts for this date yet.");
+  if (clusters.length === 0) {
+    lines.push("", "No event clusters for this date yet.");
     return lines.join("\n");
   }
 
   for (const [period, items] of Object.entries(grouped)) {
     lines.push("", `## ${period}`);
-    for (const alert of items) {
+    for (const cluster of items) {
+      const tickers = (cluster.tickers ?? []).join(", ") || "N/A";
+      const sectors = (cluster.sectors ?? []).join(", ") || "N/A";
+      const sources = cluster.source_tweet_urls ?? [];
       lines.push(
         "",
-        `### ${alert.title}`,
-        `- Type: ${alert.alert_type}`,
-        `- Impact max: ${alert.impact_max ?? "N/A"}`,
-        `- Confidence avg: ${alert.confidence_avg ?? "N/A"}`,
-        `- Tickers: ${(alert.tickers ?? []).join(", ") || "N/A"}`,
-        `- Sectors: ${(alert.sectors ?? []).join(", ") || "N/A"}`,
+        `### ${cluster.title}`,
+        `- Time: ${hktTime(cluster.last_seen_at)} HKT`,
+        `- Impact: ${cluster.impact_max}/10`,
+        `- Confidence: ${cluster.confidence_avg ?? cluster.confidence_max ?? "N/A"}/10`,
+        `- Source count: ${cluster.source_count}`,
+        `- Source quality: ${cluster.source_quality ?? "unknown"}`,
+        `- Time horizon: ${cluster.time_horizon ?? "unclear"}`,
+        `- Tickers: ${tickers}`,
+        `- Sectors: ${sectors}`,
         "",
-        alert.message_markdown,
+        `Summary: ${cluster.summary_zh}`,
+        "",
+        `Why it matters: ${cluster.why_it_matters_zh || "N/A"}`,
+        "",
+        `Mechanism: ${cluster.market_mechanism_zh || "N/A"}`,
+        "",
+        `Action: ${cluster.trading_action || "N/A"}`,
+        "",
+        `Risk: ${cluster.risk_zh || "N/A"}`,
       );
-      const sources = alert.source_tweet_urls ?? [];
       if (sources.length) {
         lines.push("", "Sources:", ...sources.slice(0, 12).map((url) => `- ${url}`));
       }
@@ -103,39 +127,30 @@ function fallbackBrief(date: string, alerts: TelegramAlert[]) {
   return lines.join("\n");
 }
 
-async function getStudy(date: string): Promise<{ brief: StudyBrief | null; fallback: string; alerts: TelegramAlert[] }> {
+async function getClusters(date: string): Promise<EventCluster[]> {
   const supabase = getSupabaseServerClient();
-  const { data: briefData } = await supabase
-    .from("daily_study_briefs")
-    .select("study_date,timezone,title,brief_markdown,alert_count,tickers,sectors,source_tweet_urls,updated_at")
-    .eq("study_date", date)
-    .maybeSingle();
-
   const { start, end } = dateBounds(date);
-  const { data: alertsData, error } = await supabase
-    .from("telegram_alerts")
-    .select("id,alert_type,title,message_markdown,source_tweet_urls,impact_max,confidence_avg,tickers,sectors,period_start,created_at")
-    .in("alert_type", STUDY_ALERT_TYPES)
-    .gte("created_at", start)
-    .lt("created_at", end)
-    .order("created_at", { ascending: true });
+  const { data, error } = await supabase
+    .from("event_clusters")
+    .select(
+      "id,fingerprint,title,summary_zh,why_it_matters_zh,market_mechanism_zh,trading_action,risk_zh,impact_max,confidence_avg,confidence_max,source_quality,time_horizon,tickers,sectors,tweet_ids,source_handles,source_tweet_urls,source_count,first_seen_at,last_seen_at,last_tweet_created_at",
+    )
+    .gte("last_seen_at", start)
+    .lt("last_seen_at", end)
+    .order("last_seen_at", { ascending: true });
 
   if (error) throw new Error(error.message);
-  const alerts = (alertsData ?? []) as TelegramAlert[];
-  return {
-    brief: (briefData as StudyBrief | null) ?? null,
-    fallback: fallbackBrief(date, alerts),
-    alerts,
-  };
+  return (data ?? []) as EventCluster[];
 }
 
 export default async function StudyPage({ searchParams }: { searchParams: SearchParams }) {
   const params = await searchParams;
   const selectedDate = params.date || hktDateString();
-  const { fallback, alerts } = await getStudy(selectedDate);
-  const markdown = fallback;
-  const tickers = Array.from(new Set(alerts.flatMap((alert) => alert.tickers ?? [])));
-  const sectors = Array.from(new Set(alerts.flatMap((alert) => alert.sectors ?? [])));
+  const clusters = await getClusters(selectedDate);
+  const markdown = buildMarkdown(selectedDate, clusters);
+  const tickers = uniq(clusters.flatMap((cluster) => cluster.tickers ?? []));
+  const sectors = uniq(clusters.flatMap((cluster) => cluster.sectors ?? []));
+  const sourceCount = clusters.reduce((sum, cluster) => sum + cluster.source_count, 0);
 
   return (
     <main className="min-h-screen bg-[#05070a] text-zinc-100">
@@ -143,9 +158,9 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
         <header className="flex flex-col gap-4 border-b border-zinc-800 pb-5 lg:flex-row lg:items-end lg:justify-between">
           <div>
             <p className="font-mono text-xs uppercase tracking-[0.2em] text-violet-400">AI Study View</p>
-            <h1 className="mt-2 text-3xl font-semibold tracking-normal text-white sm:text-4xl">每日 AI 研究稿</h1>
+            <h1 className="mt-2 text-3xl font-semibold tracking-normal text-white sm:text-4xl">每日事件研究稿</h1>
             <p className="mt-2 max-w-2xl text-sm leading-6 text-zinc-400">
-              乾淨 Markdown 輸出，專門俾你複製去 ChatGPT / Claude / Grok 做每日投資復盤。
+              以 event cluster 為單位輸出，已合併相近 tweets，方便直接交俾 AI 做每日投資復盤。
             </p>
           </div>
           <nav className="flex flex-wrap gap-2 text-sm">
@@ -155,7 +170,7 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
           </nav>
         </header>
 
-        <section className="grid gap-3 border border-zinc-800 bg-zinc-950/70 p-4 lg:grid-cols-[1fr_360px]">
+        <section className="grid gap-3 border border-zinc-800 bg-zinc-950/70 p-4 lg:grid-cols-[1fr_420px]">
           <form className="flex flex-col gap-2 sm:flex-row sm:items-end" action="/study">
             <label className="text-sm text-zinc-400">
               HKT 日期
@@ -163,10 +178,14 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
             </label>
             <button className="h-10 border border-zinc-700 px-4 text-sm text-zinc-100 hover:bg-zinc-900" type="submit">載入</button>
           </form>
-          <div className="grid grid-cols-3 gap-2 text-right">
+          <div className="grid grid-cols-4 gap-2 text-right">
             <div className="border border-zinc-800 bg-black/20 px-3 py-2">
-              <p className="font-mono text-xl font-semibold text-white">{alerts.length}</p>
-              <p className="text-xs text-zinc-500">Alerts</p>
+              <p className="font-mono text-xl font-semibold text-white">{clusters.length}</p>
+              <p className="text-xs text-zinc-500">Clusters</p>
+            </div>
+            <div className="border border-zinc-800 bg-black/20 px-3 py-2">
+              <p className="font-mono text-xl font-semibold text-white">{sourceCount}</p>
+              <p className="text-xs text-zinc-500">Sources</p>
             </div>
             <div className="border border-zinc-800 bg-black/20 px-3 py-2">
               <p className="font-mono text-xl font-semibold text-white">{tickers.length}</p>
@@ -179,7 +198,7 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
           </div>
         </section>
 
-        <section className="grid gap-4 lg:grid-cols-[260px_1fr]">
+        <section className="grid gap-4 lg:grid-cols-[280px_1fr]">
           <aside className="space-y-4 border border-zinc-800 bg-zinc-950/70 p-4">
             <div>
               <p className="text-xs font-semibold text-zinc-500">Tickers</p>
@@ -194,13 +213,13 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
               </div>
             </div>
             <p className="text-xs leading-5 text-zinc-500">
-              呢個 textarea 已排除 session header 同 08:00 digest，只保留原始研究訊號。撳 Copy Markdown 後可以直接交俾 AI 做復盤。
+              呢個 Markdown 已按時段整理 event clusters，包含 source count、ticker、sector、confidence、time horizon、action 同 source links。
             </p>
           </aside>
 
           <div className="min-w-0 border border-zinc-800 bg-black/40">
             <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
-              <p className="font-mono text-xs uppercase text-zinc-500">Markdown Export</p>
+              <p className="font-mono text-xs uppercase text-zinc-500">Cluster Markdown Export</p>
               <CopyMarkdownButton value={markdown} />
             </div>
             <textarea
