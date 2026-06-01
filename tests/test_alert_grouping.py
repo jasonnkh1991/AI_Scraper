@@ -184,6 +184,38 @@ class AlertGroupingTest(unittest.TestCase):
         self.assertIn("SNOW", message)
         self.assertIn("https://x.com/source/status/1", message)
 
+    def test_priority_scoring_catches_jensen_rubin(self) -> None:
+        score, reasons = crawler.calculate_priority({
+            "author_handle": "business",
+            "author_name": "Bloomberg Business",
+            "tweet_text": "Nvidia's Jensen Huang discusses Vera Rubin and a new AI chip at Computex. $NVDA",
+            "tweet_created_at": "2026-06-01T04:28:57+00:00",
+        })
+
+        self.assertGreaterEqual(score, 50)
+        self.assertTrue(any("jensen" in reason for reason in reasons))
+        self.assertTrue(any("nvidia" in reason for reason in reasons))
+
+    def test_digest_message_includes_pending_section(self) -> None:
+        group = [record("1", "Snowflake AWS AI compute deal", ["SNOW", "AMZN"])]
+        message = crawler.build_digest_message(
+            "Test Digest",
+            [group],
+            crawler.localized_now("Asia/Hong_Kong"),
+            crawler.localized_now("Asia/Hong_Kong"),
+            [{
+                "author_handle": "business",
+                "priority_score": 70,
+                "priority_reason": ["entity:jensen_huang:25"],
+                "tweet_text": "Nvidia Jensen Huang mentions Vera Rubin.",
+                "tweet_url": "https://x.com/business/status/1",
+            }],
+        )
+
+        self.assertIn("High-priority pending", message)
+        self.assertIn("待分析但值得跟進", message)
+        self.assertIn("Vera Rubin", message)
+
 
 if __name__ == "__main__":
     unittest.main()

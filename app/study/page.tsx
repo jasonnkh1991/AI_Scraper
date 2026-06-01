@@ -32,6 +32,17 @@ type EventCluster = {
   last_tweet_created_at: string | null;
 };
 
+type PendingTweet = {
+  tweet_id: string;
+  author_handle: string;
+  tweet_text: string;
+  tweet_url: string;
+  tweet_created_at: string | null;
+  priority_score: number;
+  priority_reason: string[] | null;
+  inserted_at: string;
+};
+
 function hktDateString(date = new Date()) {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Hong_Kong",
@@ -77,8 +88,13 @@ function uniq(values: string[]) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
-function buildMarkdown(date: string, clusters: EventCluster[]) {
-  const lines = [`# Daily Market Study Brief - ${date} HKT`, "", `Event clusters: ${clusters.length}`];
+function buildMarkdown(date: string, clusters: EventCluster[], pending: PendingTweet[]) {
+  const lines = [
+    `# Daily Market Study Brief - ${date} HKT`,
+    "",
+    `Event clusters: ${clusters.length}`,
+    `High-priority pending: ${pending.length}`,
+  ];
   const grouped = clusters.reduce<Record<string, EventCluster[]>>((acc, cluster) => {
     const label = periodLabel(cluster.last_seen_at || cluster.first_seen_at);
     acc[label] = acc[label] || [];
@@ -86,8 +102,8 @@ function buildMarkdown(date: string, clusters: EventCluster[]) {
     return acc;
   }, {});
 
-  if (clusters.length === 0) {
-    lines.push("", "No event clusters for this date yet.");
+  if (clusters.length === 0 && pending.length === 0) {
+    lines.push("", "No event clusters or high-priority pending tweets for this date yet.");
     return lines.join("\n");
   }
 
@@ -124,6 +140,22 @@ function buildMarkdown(date: string, clusters: EventCluster[]) {
       }
     }
   }
+
+  if (pending.length) {
+    lines.push("", "## Pending 但值得跟進", "", "以下內容尚未完成 full AI scoring，但 priority_score 顯示可能重要，digest 不應忽略。/ These are not fully analyzed yet.");
+    for (const item of pending) {
+      lines.push(
+        "",
+        `### @${item.author_handle} · Priority ${item.priority_score}`,
+        `- Time: ${hktTime(item.tweet_created_at || item.inserted_at)} HKT`,
+        `- Reason: ${(item.priority_reason ?? []).join(", ") || "N/A"}`,
+        "",
+        item.tweet_text,
+        "",
+        `Source: ${item.tweet_url}`,
+      );
+    }
+  }
   return lines.join("\n");
 }
 
@@ -143,14 +175,30 @@ async function getClusters(date: string): Promise<EventCluster[]> {
   return (data ?? []) as EventCluster[];
 }
 
+async function getPending(date: string): Promise<PendingTweet[]> {
+  const supabase = getSupabaseServerClient();
+  const { start, end } = dateBounds(date);
+  const { data, error } = await supabase
+    .from("tweet_queue")
+    .select("tweet_id,author_handle,tweet_text,tweet_url,tweet_created_at,priority_score,priority_reason,inserted_at")
+    .eq("status", "pending")
+    .gte("priority_score", 50)
+    .gte("tweet_created_at", start)
+    .lt("tweet_created_at", end)
+    .order("priority_score", { ascending: false })
+    .limit(50);
+
+  if (error) throw new Error(error.message);
+  return (data ?? []) as PendingTweet[];
+}
+
 export default async function StudyPage({ searchParams }: { searchParams: SearchParams }) {
   const params = await searchParams;
   const selectedDate = params.date || hktDateString();
-  const clusters = await getClusters(selectedDate);
-  const markdown = buildMarkdown(selectedDate, clusters);
+  const [clusters, pending] = await Promise.all([getClusters(selectedDate), getPending(selectedDate)]);
+  const markdown = buildMarkdown(selectedDate, clusters, pending);
   const tickers = uniq(clusters.flatMap((cluster) => cluster.tickers ?? []));
   const sectors = uniq(clusters.flatMap((cluster) => cluster.sectors ?? []));
-  const sourceCount = clusters.reduce((sum, cluster) => sum + cluster.source_count, 0);
 
   return (
     <main className="min-h-screen bg-[#05070a] text-zinc-100">
@@ -184,8 +232,8 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
               <p className="text-xs text-zinc-500">Clusters</p>
             </div>
             <div className="border border-zinc-800 bg-black/20 px-3 py-2">
-              <p className="font-mono text-xl font-semibold text-white">{sourceCount}</p>
-              <p className="text-xs text-zinc-500">Sources</p>
+              <p className="font-mono text-xl font-semibold text-white">{pending.length}</p>
+              <p className="text-xs text-zinc-500">Pending</p>
             </div>
             <div className="border border-zinc-800 bg-black/20 px-3 py-2">
               <p className="font-mono text-xl font-semibold text-white">{tickers.length}</p>

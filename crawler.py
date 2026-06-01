@@ -29,6 +29,15 @@ POWER_HOUR_DIGEST_LOOKBACK_HOURS = int(os.getenv("POWER_HOUR_DIGEST_LOOKBACK_HOU
 PREMARKET_DIGEST_LOOKBACK_HOURS = int(os.getenv("PREMARKET_DIGEST_LOOKBACK_HOURS", "12"))
 MARKET_OPEN_DIGEST_LOOKBACK_HOURS = int(os.getenv("MARKET_OPEN_DIGEST_LOOKBACK_HOURS", "3"))
 MAX_DIGEST_EVENTS = int(os.getenv("MAX_DIGEST_EVENTS", "6"))
+DIGEST_PENDING_PRIORITY_THRESHOLD = int(os.getenv("DIGEST_PENDING_PRIORITY_THRESHOLD", "50"))
+DIGEST_PENDING_LIMIT = int(os.getenv("DIGEST_PENDING_LIMIT", "12"))
+DIGEST_MODEL = os.getenv("DIGEST_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+DIGEST_BASE_URL = os.getenv("DIGEST_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+DIGEST_API_KEY = os.getenv("DIGEST_API_KEY") or os.getenv("OPENAI_API_KEY")
+PRIORITY_AI_PROCESS_LIMIT = int(os.getenv("PRIORITY_AI_PROCESS_LIMIT", "25"))
+NORMAL_AI_PROCESS_LIMIT = int(os.getenv("NORMAL_AI_PROCESS_LIMIT", "10"))
+STALE_PENDING_HOURS = int(os.getenv("STALE_PENDING_HOURS", "18"))
+STALE_PRIORITY_KEEP_SCORE = int(os.getenv("STALE_PRIORITY_KEEP_SCORE", "40"))
 LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "Asia/Hong_Kong")
 STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
@@ -424,6 +433,9 @@ def queued_row_to_tweet(row: Dict[str, Any]) -> Dict[str, Any]:
         "tweet_created_at": row.get("tweet_created_at"),
         "author_followers": row.get("author_followers"),
         "source": row.get("source") or "x",
+        "priority_score": int(row.get("priority_score") or 0),
+        "priority_reason": row.get("priority_reason") or [],
+        "inserted_at": row.get("inserted_at"),
     }
 
 
@@ -531,12 +543,106 @@ def save_last_processed_tweet_id(supabase: Client, tweet_id: str) -> None:
         raise
 
 
+SOURCE_PRIORITY = {
+    "realDonaldTrump": 40,
+    "POTUS": 40,
+    "elonmusk": 40,
+    "business": 25,
+    "Reuters": 25,
+    "ReutersBiz": 25,
+    "WSJ": 25,
+    "CNBC": 25,
+    "DeItaone": 25,
+    "financialjuice": 25,
+    "unusual_whales": 25,
+    "zerohedge": 25,
+    "Benzinga": 20,
+    "KobeissiLetter": 20,
+    "FirstSquawk": 15,
+    "sama": 15,
+    "satyanadella": 15,
+    "sundarpichai": 15,
+    "dylan522p": 15,
+    "IanCutress": 15,
+    "StockMKTNewz": 10,
+}
+
+PRIORITY_PATTERNS: List[Tuple[str, str, int]] = [
+    ("entity:elon_musk", r"\b(elon musk|elon|tesla|tsla|xai|x\.ai)\b", 25),
+    ("entity:jensen_huang", r"\b(jensen huang|jensen|黃仁勳|黃仁芬)\b", 25),
+    ("entity:leopold_aschenbrenner", r"\b(leopold aschenbrenner|situational awareness)\b", 25),
+    ("entity:sam_altman", r"\b(sam altman|openai|chatgpt|gpt-5)\b", 20),
+    ("entity:powell_or_fed_chair", r"\b(powell|fed chair|federal reserve chair|fomc|rate cut|rate hike)\b", 25),
+    ("ai_infra:nvidia", r"\b(nvidia|nvda|vera rubin|rubin|blackwell|gb200|gb300|b300|cuda|gpu|ai chip|hbm|asic)\b", 25),
+    ("ai_infra:datacenter", r"\b(data center|datacenter|ai server|liquid cooling|power grid|nuclear|vst|ceg|nrg)\b", 18),
+    ("semis:supply_chain", r"\b(tsmc|tsm|asml|amd|avgo|arm|micron|mu|intel|intc|export control)\b", 18),
+    ("market_structure:filing", r"\b(13f|13g|form 4|stake|position|insider buying|short interest)\b", 20),
+    ("market_structure:catalyst", r"\b(guidance|preannounce|downgrade|upgrade|price target|m&a|acquisition|buyback|contract|deal|capex)\b", 15),
+    ("macro:policy", r"\b(cpi|pce|nfp|tariff|sanctions|china|taiwan|iran|oil|hormuz|treasury|yields|dollar)\b", 18),
+    ("context:new_role", r"\b(nominated|confirmed|names|pick|candidate|successor)\b.{0,80}\b(fed chair|federal reserve|treasury secretary|commerce secretary)\b", 30),
+]
+
+
+def tweet_age_minutes(tweet: Dict[str, Any]) -> Optional[float]:
+    value = tweet.get("tweet_created_at")
+    if not value:
+        return None
+    try:
+        created = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds() / 60
+
+
+def calculate_priority(tweet: Dict[str, Any]) -> Tuple[int, List[str]]:
+    handle = str(tweet.get("author_handle") or "")
+    text = f"{handle} {tweet.get('author_name') or ''} {tweet.get('tweet_text') or ''}".lower()
+    score = 0
+    reasons: List[str] = []
+
+    source_score = SOURCE_PRIORITY.get(handle, SOURCE_PRIORITY.get(handle.lstrip("@"), 0))
+    if source_score:
+        score += source_score
+        reasons.append(f"source:{handle}:{source_score}")
+
+    for reason, pattern, points in PRIORITY_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+            score += points
+            reasons.append(f"{reason}:{points}")
+
+    if re.search(r"[$][A-Z]{1,5}\b|\b(NVDA|TSLA|MSFT|GOOGL|AMZN|META|AAPL|AVGO|AMD|TSM|ASML|ARM|MU|INTC)\b", str(tweet.get("tweet_text") or "")):
+        score += 10
+        reasons.append("market:explicit_ticker:10")
+
+    if re.search(r"\$\d|\b\d+(\.\d+)?%\b|\b\d+\s?(billion|million|bln|mln)\b", text):
+        score += 8
+        reasons.append("market:has_number:8")
+
+    age = tweet_age_minutes(tweet)
+    if age is not None:
+        if age < 30:
+            score += 20
+            reasons.append("freshness:<30m:20")
+        elif age < 120:
+            score += 10
+            reasons.append("freshness:<2h:10")
+        elif age > 24 * 60:
+            score -= 40
+            reasons.append("freshness:>24h:-40")
+        elif age > 12 * 60:
+            score -= 20
+            reasons.append("freshness:>12h:-20")
+
+    return max(score, 0), reasons[:16]
+
+
 def enqueue_tweets(supabase: Client, tweets: List[Dict[str, Any]]) -> int:
     if not tweets:
         return 0
 
     rows = []
     for tweet in tweets:
+        priority_score, priority_reason = calculate_priority(tweet)
         rows.append({
             "tweet_id": tweet["tweet_id"],
             "tweet_id_int": tweet.get("tweet_id_int") or tweet_id_to_int(tweet.get("tweet_id")),
@@ -548,6 +654,8 @@ def enqueue_tweets(supabase: Client, tweets: List[Dict[str, Any]]) -> int:
             "author_followers": tweet.get("author_followers"),
             "source": tweet.get("source") or "x",
             "status": "pending",
+            "priority_score": priority_score,
+            "priority_reason": priority_reason,
         })
 
     try:
@@ -563,23 +671,62 @@ def enqueue_tweets(supabase: Client, tweets: List[Dict[str, Any]]) -> int:
         raise
 
 
-def fetch_pending_queue_tweets(supabase: Client, limit: int = AI_PROCESS_LIMIT) -> List[Dict[str, Any]]:
+QUEUE_SELECT_COLUMNS = "tweet_id,tweet_id_int,author_handle,author_name,tweet_text,tweet_url,tweet_created_at,author_followers,source,attempts,priority_score,priority_reason,inserted_at"
+
+
+def fetch_priority_queue_tweets(supabase: Client, limit: int = PRIORITY_AI_PROCESS_LIMIT) -> List[Dict[str, Any]]:
     try:
         response = (
             supabase.table("tweet_queue")
-            .select("tweet_id,tweet_id_int,author_handle,author_name,tweet_text,tweet_url,tweet_created_at,author_followers,source,attempts")
+            .select(QUEUE_SELECT_COLUMNS)
             .eq("status", "pending")
             .lt("attempts", QUEUE_MAX_ATTEMPTS)
-            .order("tweet_id_int", desc=False)
+            .gte("priority_score", DIGEST_PENDING_PRIORITY_THRESHOLD)
+            .order("priority_score", desc=True)
+            .order("tweet_id_int", desc=True)
             .limit(limit)
             .execute()
         )
         rows = list(response.data or [])
-        logger.info("Loaded %s pending tweets from queue for AI processing limit=%s", len(rows), limit)
+        logger.info("Loaded %s priority pending tweets limit=%s", len(rows), limit)
         return rows
     except Exception:
-        logger.exception("Failed to fetch pending tweets from Supabase tweet_queue")
+        logger.exception("Failed to fetch priority pending tweets from Supabase tweet_queue")
         raise
+
+
+def fetch_normal_queue_tweets(supabase: Client, exclude_ids: set[str], limit: int = NORMAL_AI_PROCESS_LIMIT) -> List[Dict[str, Any]]:
+    try:
+        query = (
+            supabase.table("tweet_queue")
+            .select(QUEUE_SELECT_COLUMNS)
+            .eq("status", "pending")
+            .lt("attempts", QUEUE_MAX_ATTEMPTS)
+            .lt("priority_score", DIGEST_PENDING_PRIORITY_THRESHOLD)
+            .order("tweet_id_int", desc=False)
+            .limit(limit + len(exclude_ids))
+        )
+        response = query.execute()
+        rows = [row for row in list(response.data or []) if str(row.get("tweet_id")) not in exclude_ids][:limit]
+        logger.info("Loaded %s normal pending tweets limit=%s", len(rows), limit)
+        return rows
+    except Exception:
+        logger.exception("Failed to fetch normal pending tweets from Supabase tweet_queue")
+        raise
+
+
+def fetch_pending_queue_tweets(supabase: Client) -> List[Dict[str, Any]]:
+    priority_rows = fetch_priority_queue_tweets(supabase, PRIORITY_AI_PROCESS_LIMIT)
+    exclude_ids = {str(row.get("tweet_id")) for row in priority_rows}
+    normal_rows = fetch_normal_queue_tweets(supabase, exclude_ids, NORMAL_AI_PROCESS_LIMIT)
+    rows = priority_rows + normal_rows
+    logger.info(
+        "Loaded %s pending tweets for AI priority=%s normal=%s",
+        len(rows),
+        len(priority_rows),
+        len(normal_rows),
+    )
+    return rows
 
 
 def mark_queue_processed(supabase: Client, tweet_id: str) -> None:
@@ -593,6 +740,32 @@ def mark_queue_processed(supabase: Client, tweet_id: str) -> None:
     except Exception:
         logger.exception("Failed to mark queued tweet processed tweet_id=%s", tweet_id)
         raise
+
+
+def mark_stale_pending_tweets(supabase: Client) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=STALE_PENDING_HOURS)
+    try:
+        response = (
+            supabase.table("tweet_queue")
+            .update({
+                "status": "processed",
+                "is_stale": True,
+                "stale_processed_at": datetime.now(timezone.utc).isoformat(),
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "last_error": "stale_low_priority_skip",
+            })
+            .eq("status", "pending")
+            .lt("priority_score", STALE_PRIORITY_KEEP_SCORE)
+            .lt("inserted_at", cutoff.isoformat())
+            .execute()
+        )
+        count = len(response.data or []) if getattr(response, "data", None) is not None else 0
+        logger.info("Marked %s stale low-priority pending tweets processed", count)
+        return count
+    except Exception:
+        logger.exception("Failed to mark stale pending tweets")
+        return 0
 
 
 def mark_queue_failed(supabase: Client, row: Dict[str, Any], error: Exception) -> None:
@@ -678,6 +851,29 @@ def fetch_cluster_rows_between(supabase: Client, start: datetime, end: datetime,
     except Exception:
         logger.exception("Failed to fetch %s cluster digest rows", label)
         raise
+
+
+def fetch_digest_pending_rows(supabase: Client, start: datetime, end: datetime) -> List[Dict[str, Any]]:
+    try:
+        response = (
+            supabase.table("tweet_queue")
+            .select(QUEUE_SELECT_COLUMNS)
+            .eq("status", "pending")
+            .lt("attempts", QUEUE_MAX_ATTEMPTS)
+            .gte("priority_score", DIGEST_PENDING_PRIORITY_THRESHOLD)
+            .gte("tweet_created_at", start.astimezone(timezone.utc).isoformat())
+            .lt("tweet_created_at", end.astimezone(timezone.utc).isoformat())
+            .order("priority_score", desc=True)
+            .order("tweet_id_int", desc=True)
+            .limit(DIGEST_PENDING_LIMIT)
+            .execute()
+        )
+        rows = list(response.data or [])
+        logger.info("Loaded %s high-priority pending rows for digest", len(rows))
+        return rows
+    except Exception:
+        logger.exception("Failed to fetch pending rows for digest")
+        return []
 
 
 def fetch_overnight_digest_rows(supabase: Client, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
@@ -1133,7 +1329,9 @@ def build_digest_message(
     groups: List[List[Dict[str, Any]]],
     start: datetime,
     end: datetime,
+    pending_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
+    pending_rows = pending_rows or []
     ranked = sorted(
         groups,
         key=lambda group: (
@@ -1148,6 +1346,7 @@ def build_digest_message(
         f"<b>━━ {html.escape(title)} ━━</b>",
         f"<b>時段：</b>{html.escape(start.strftime('%Y-%m-%d %H:%M'))}-{html.escape(end.strftime('%H:%M'))} HKT",
         f"<b>整合事件：</b>{len(ranked)} / <b>原始訊號：</b>{sum(len(group) for group in groups)}",
+        f"<b>High-priority pending：</b>{len(pending_rows)}",
     ]
 
     for idx, group in enumerate(ranked, start=1):
@@ -1165,7 +1364,102 @@ def build_digest_message(
             f"來源：{format_digest_source_links(group)}",
         ])
 
+    if pending_rows:
+        lines.extend(["", "<b>待分析但值得跟進：</b>"])
+        for idx, row in enumerate(pending_rows[:DIGEST_PENDING_LIMIT], start=1):
+            reasons = ", ".join(row.get("priority_reason") or []) or "priority hit"
+            lines.extend([
+                f"{idx}. @{html.escape(str(row.get('author_handle') or 'unknown'))} · Priority {int(row.get('priority_score') or 0)}",
+                f"狀態：pending，尚未完成 full AI scoring",
+                f"原因：{html.escape(truncate_text(reasons, 140))}",
+                f"內容：{html.escape(truncate_text(row.get('tweet_text', ''), 220))}",
+                f"來源：{html.escape(str(row.get('tweet_url') or ''))}",
+                "",
+            ])
+
     return "\n".join(lines)
+
+
+def get_digest_client() -> OpenAI:
+    if not DIGEST_API_KEY:
+        raise RuntimeError("Missing DIGEST_API_KEY or OPENAI_API_KEY")
+    kwargs: Dict[str, Any] = {"api_key": DIGEST_API_KEY, "timeout": OPENAI_TIMEOUT_SECONDS, "max_retries": OPENAI_MAX_RETRIES}
+    if DIGEST_BASE_URL:
+        kwargs["base_url"] = DIGEST_BASE_URL
+    return OpenAI(**kwargs)
+
+
+def synthesize_digest_message(
+    title: str,
+    groups: List[List[Dict[str, Any]]],
+    pending_rows: List[Dict[str, Any]],
+    start: datetime,
+    end: datetime,
+) -> str:
+    fallback = build_digest_message(title, groups, start, end, pending_rows)
+    if not groups and not pending_rows:
+        return fallback
+
+    payload = {
+        "title": title,
+        "period_hkt": f"{start.strftime('%Y-%m-%d %H:%M')}-{end.strftime('%H:%M')}",
+        "confirmed_clusters": [
+            {
+                "summary": merge_group_insight(group).get("summary_zh"),
+                "why": merge_group_insight(group).get("why_it_matters_zh"),
+                "mechanism": merge_group_insight(group).get("market_mechanism_zh"),
+                "action": merge_group_insight(group).get("trading_action"),
+                "risk": merge_group_insight(group).get("risk_zh"),
+                "impact": merge_group_insight(group).get("impact_score"),
+                "confidence": merge_group_insight(group).get("confidence_score"),
+                "tickers": merge_group_insight(group).get("affected_tickers"),
+                "sectors": merge_group_insight(group).get("target_sectors"),
+                "sources": [item["tweet"].get("tweet_url") for item in group],
+            }
+            for group in groups[:MAX_DIGEST_EVENTS]
+        ],
+        "high_priority_pending": [
+            {
+                "author": row.get("author_handle"),
+                "priority_score": row.get("priority_score"),
+                "priority_reason": row.get("priority_reason"),
+                "created_at": row.get("tweet_created_at"),
+                "text": row.get("tweet_text"),
+                "url": row.get("tweet_url"),
+            }
+            for row in pending_rows[:DIGEST_PENDING_LIMIT]
+        ],
+    }
+    try:
+        completion = get_digest_client().chat.completions.create(
+            model=DIGEST_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an institutional macro/tech equity analyst. Write in Traditional Chinese for an active investor. "
+                        "Do not ignore high_priority_pending. Separate confirmed clusters from pending items. "
+                        "Output concise plain text with these sections: 市場主線, 新增重大變量, 已確認事件, "
+                        "Pending 但值得跟進, 受惠/受壓 ticker, 交易假設, 失效條件, 下一輪 monitor keyword. "
+                        "Mention uncertainty clearly. Keep it under 1600 Chinese characters."
+                    ),
+                },
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0.2,
+        )
+        content = completion.choices[0].message.content or ""
+        if not content.strip():
+            return fallback
+        header = (
+            f"<b>━━ {html.escape(title)} ━━</b>\n"
+            f"<b>時段：</b>{html.escape(start.strftime('%Y-%m-%d %H:%M'))}-{html.escape(end.strftime('%H:%M'))} HKT\n"
+            f"<b>Confirmed clusters：</b>{len(groups)} · <b>High-priority pending：</b>{len(pending_rows)}\n\n"
+        )
+        return header + html.escape(content.strip())
+    except Exception:
+        logger.warning("Digest synthesis failed; using deterministic fallback", exc_info=True)
+        return fallback
 
 
 def build_overnight_digest_message(groups: List[List[Dict[str, Any]]], now: Optional[datetime] = None) -> str:
@@ -1206,7 +1500,10 @@ def send_overnight_digest_if_due(supabase: Client, now: Optional[datetime] = Non
         return
 
     rows = fetch_overnight_digest_rows(supabase, now)
-    if not rows:
+    end = localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=DIGEST_LOOKBACK_HOURS)
+    pending_rows = fetch_digest_pending_rows(supabase, start, end)
+    if not rows and not pending_rows:
         message = f"<b>━━ Overnight Market Digest ━━</b>\n今日 HKT 00:00-08:00 暫時未有高衝擊訊號。"
         post_telegram_message(message, disable_preview=True)
         archive_telegram_alert(
@@ -1225,10 +1522,9 @@ def send_overnight_digest_if_due(supabase: Client, now: Optional[datetime] = Non
         return
 
     groups = cluster_rows_to_groups(rows)
-    message = build_overnight_digest_message(groups, now)
+    message = synthesize_digest_message("Overnight Market Digest", groups, pending_rows, start, end)
     post_telegram_message(message, disable_preview=True)
-    end = localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0)
-    metadata = digest_metadata_from_cluster_rows(rows, end - timedelta(hours=DIGEST_LOOKBACK_HOURS), end)
+    metadata = digest_metadata_from_cluster_rows(rows, start, end)
     archive_telegram_alert(
         supabase,
         "overnight_digest",
@@ -1255,7 +1551,8 @@ def send_power_hour_digest_if_due(supabase: Client, now: Optional[datetime] = No
     end = current.replace(hour=2, minute=30, second=0, microsecond=0)
     start = end - timedelta(hours=POWER_HOUR_DIGEST_LOOKBACK_HOURS)
     rows = fetch_power_hour_digest_rows(supabase, now)
-    if not rows:
+    pending_rows = fetch_digest_pending_rows(supabase, start, end)
+    if not rows and not pending_rows:
         message = "<b>━━ Midday / Power Hour Prep ━━</b>\n過去時段暫時未有高衝擊訊號。"
         post_telegram_message(message, disable_preview=True)
         archive_telegram_alert(
@@ -1274,7 +1571,7 @@ def send_power_hour_digest_if_due(supabase: Client, now: Optional[datetime] = No
         return
 
     groups = cluster_rows_to_groups(rows)
-    message = build_power_hour_digest_message(groups, now)
+    message = synthesize_digest_message("Midday / Power Hour Prep", groups, pending_rows, start, end)
     post_telegram_message(message, disable_preview=True)
     metadata = digest_metadata_from_cluster_rows(rows, start, end)
     archive_telegram_alert(
@@ -1303,7 +1600,8 @@ def send_premarket_digest_if_due(supabase: Client, now: Optional[datetime] = Non
     end = current.replace(hour=20, minute=30, second=0, microsecond=0)
     start = end - timedelta(hours=PREMARKET_DIGEST_LOOKBACK_HOURS)
     rows = fetch_premarket_digest_rows(supabase, now)
-    if not rows:
+    pending_rows = fetch_digest_pending_rows(supabase, start, end)
+    if not rows and not pending_rows:
         message = "<b>━━ Pre-Market Brief ━━</b>\n美股開市前暫時未有新高衝擊 cluster。"
         post_telegram_message(message, disable_preview=True)
         archive_telegram_alert(
@@ -1319,7 +1617,7 @@ def send_premarket_digest_if_due(supabase: Client, now: Optional[datetime] = Non
         return
 
     groups = cluster_rows_to_groups(rows)
-    message = build_premarket_digest_message(groups, now)
+    message = synthesize_digest_message("Pre-Market Brief", groups, pending_rows, start, end)
     post_telegram_message(message, disable_preview=True)
     archive_telegram_alert(
         supabase,
@@ -1347,7 +1645,8 @@ def send_market_open_digest_if_due(supabase: Client, now: Optional[datetime] = N
     end = current.replace(hour=23, minute=15, second=0, microsecond=0)
     start = end - timedelta(hours=MARKET_OPEN_DIGEST_LOOKBACK_HOURS)
     rows = fetch_market_open_digest_rows(supabase, now)
-    if not rows:
+    pending_rows = fetch_digest_pending_rows(supabase, start, end)
+    if not rows and not pending_rows:
         message = "<b>━━ Market Open Recap ━━</b>\n美股開市後暫時未有新高衝擊 cluster。"
         post_telegram_message(message, disable_preview=True)
         archive_telegram_alert(
@@ -1363,7 +1662,7 @@ def send_market_open_digest_if_due(supabase: Client, now: Optional[datetime] = N
         return
 
     groups = cluster_rows_to_groups(rows)
-    message = build_market_open_digest_message(groups, now)
+    message = synthesize_digest_message("Market Open Recap", groups, pending_rows, start, end)
     post_telegram_message(message, disable_preview=True)
     archive_telegram_alert(
         supabase,
@@ -2151,8 +2450,9 @@ def main() -> int:
         )
     tweets.sort(key=lambda tweet: tweet["tweet_id_int"])
     enqueue_tweets(supabase, tweets)
+    stale_count = mark_stale_pending_tweets(supabase)
     queue_backlog_count = fetch_queue_backlog_count(supabase)
-    queued_rows = fetch_pending_queue_tweets(supabase, AI_PROCESS_LIMIT)
+    queued_rows = fetch_pending_queue_tweets(supabase)
 
     if not queued_rows:
         logger.info(
@@ -2166,7 +2466,7 @@ def main() -> int:
     logger.info(
         "Processing %s queued tweets with AI_PROCESS_LIMIT=%s queue_backlog_before=%s",
         len(queued_rows),
-        AI_PROCESS_LIMIT,
+        f"priority:{PRIORITY_AI_PROCESS_LIMIT}+normal:{NORMAL_AI_PROCESS_LIMIT} stale_skipped:{stale_count}",
         queue_backlog_count,
     )
     fully_processed = True

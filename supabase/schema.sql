@@ -103,13 +103,27 @@ create table if not exists public.tweet_queue (
   status text not null default 'pending' check (status in ('pending', 'processed', 'failed')),
   attempts int not null default 0,
   last_error text,
+  priority_score int not null default 0,
+  priority_reason text[] not null default '{}',
+  is_stale boolean not null default false,
+  stale_processed_at timestamptz,
   inserted_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   processed_at timestamptz
 );
 
+alter table public.tweet_queue
+  add column if not exists priority_score int not null default 0,
+  add column if not exists priority_reason text[] not null default '{}',
+  add column if not exists is_stale boolean not null default false,
+  add column if not exists stale_processed_at timestamptz;
+
 create index if not exists tweet_queue_pending_idx
-  on public.tweet_queue (status, attempts, tweet_id_int);
+  on public.tweet_queue (status, attempts, priority_score desc, tweet_id_int desc);
+
+create index if not exists tweet_queue_priority_idx
+  on public.tweet_queue (status, priority_score desc, tweet_id_int desc)
+  where status = 'pending';
 
 create index if not exists tweet_queue_inserted_at_idx
   on public.tweet_queue (inserted_at desc);

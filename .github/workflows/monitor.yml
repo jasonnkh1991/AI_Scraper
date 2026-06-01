@@ -101,8 +101,17 @@ jobs:
           OVERNIGHT_FETCH_LIMIT: ${{ inputs.overnight_fetch_limit || '10' }}
           AI_PROCESS_LIMIT: ${{ inputs.ai_process_limit || '15' }}
           MAX_NEW_TWEETS_PER_RUN: ${{ inputs.ai_process_limit || '15' }}
+          PRIORITY_AI_PROCESS_LIMIT: "25"
+          NORMAL_AI_PROCESS_LIMIT: "10"
+          STALE_PENDING_HOURS: "18"
+          STALE_PRIORITY_KEEP_SCORE: "40"
           OPENAI_TIMEOUT_SECONDS: "20"
           OPENAI_MAX_RETRIES: "0"
+          DIGEST_MODEL: ${{ secrets.DIGEST_MODEL || 'gemini-3-flash-preview' }}
+          DIGEST_BASE_URL: ${{ secrets.DIGEST_BASE_URL || secrets.OPENAI_BASE_URL }}
+          DIGEST_API_KEY: ${{ secrets.DIGEST_API_KEY || secrets.OPENAI_API_KEY }}
+          DIGEST_PENDING_PRIORITY_THRESHOLD: "50"
+          DIGEST_PENDING_LIMIT: "12"
           IMMEDIATE_ALERT_MIN_IMPACT: "8"
           IMMEDIATE_ALERT_MIN_CONFIDENCE: "7"
           CRITICAL_ALERT_IMPACT_SCORE: "9"
