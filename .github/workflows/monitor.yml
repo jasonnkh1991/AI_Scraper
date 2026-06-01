@@ -103,6 +103,10 @@ jobs:
           MAX_NEW_TWEETS_PER_RUN: ${{ inputs.ai_process_limit || '15' }}
           OPENAI_TIMEOUT_SECONDS: "20"
           OPENAI_MAX_RETRIES: "0"
+          IMMEDIATE_ALERT_MIN_IMPACT: "8"
+          IMMEDIATE_ALERT_MIN_CONFIDENCE: "7"
+          CRITICAL_ALERT_IMPACT_SCORE: "9"
+          POWER_HOUR_DIGEST_LOOKBACK_HOURS: "6"
           BYPASS_MARKET_WINDOW: ${{ inputs.bypass_market_window }}
           TRUTH_SOCIAL_ENABLED: ${{ inputs.truth_social_enabled || false }}
           TRUTH_SOCIAL_ACTOR_ID: IWIOv7oeNxfcjTnX5

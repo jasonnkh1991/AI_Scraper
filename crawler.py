@@ -21,13 +21,18 @@ OVERNIGHT_FETCH_LIMIT = int(os.getenv("OVERNIGHT_FETCH_LIMIT", "10"))
 QUIET_FETCH_LIMIT = int(os.getenv("QUIET_FETCH_LIMIT", "30"))
 QUIET_IMMEDIATE_IMPACT_SCORE = int(os.getenv("QUIET_IMMEDIATE_IMPACT_SCORE", "9"))
 QUIET_IMMEDIATE_CONFIDENCE_SCORE = int(os.getenv("QUIET_IMMEDIATE_CONFIDENCE_SCORE", "8"))
+IMMEDIATE_ALERT_MIN_IMPACT = int(os.getenv("IMMEDIATE_ALERT_MIN_IMPACT", "8"))
+IMMEDIATE_ALERT_MIN_CONFIDENCE = int(os.getenv("IMMEDIATE_ALERT_MIN_CONFIDENCE", "7"))
+CRITICAL_ALERT_IMPACT_SCORE = int(os.getenv("CRITICAL_ALERT_IMPACT_SCORE", "9"))
 DIGEST_LOOKBACK_HOURS = int(os.getenv("DIGEST_LOOKBACK_HOURS", "8"))
+POWER_HOUR_DIGEST_LOOKBACK_HOURS = int(os.getenv("POWER_HOUR_DIGEST_LOOKBACK_HOURS", "6"))
 MAX_DIGEST_EVENTS = int(os.getenv("MAX_DIGEST_EVENTS", "6"))
 LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "Asia/Hong_Kong")
 STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
 RECENT_EVENT_FINGERPRINTS_KEY = "recent_event_fingerprints"
 LAST_DIGEST_DATE_KEY = "last_overnight_digest_date"
+LAST_POWER_HOUR_DIGEST_DATE_KEY = "last_power_hour_digest_date"
 ALERT_ARCHIVE_ENABLED = os.getenv("ALERT_ARCHIVE_ENABLED", "true").lower() in {"1", "true", "yes"}
 STUDY_ALERT_TYPES = ["group_alert", "single_alert", "study_only_signal"]
 MAX_TRACKED_TWEET_IDS = int(os.getenv("MAX_TRACKED_TWEET_IDS", "500"))
@@ -290,6 +295,22 @@ def should_send_overnight_digest(now: Optional[datetime] = None) -> bool:
         return False
     current = localized_now(LOCAL_TIMEZONE, now)
     return current.hour == 8 and current.minute == 7
+
+
+def should_send_power_hour_digest(now: Optional[datetime] = None) -> bool:
+    if os.getenv("BYPASS_MARKET_WINDOW", "").lower() in {"1", "true", "yes"}:
+        return False
+    current = localized_now(LOCAL_TIMEZONE, now)
+    return current.hour == 2 and 30 <= current.minute < 45
+
+
+def is_immediate_telegram_alert(insight: Dict[str, Any]) -> bool:
+    score = int(insight.get("impact_score") or 0)
+    confidence = int(insight.get("confidence_score") or 0)
+    return score >= CRITICAL_ALERT_IMPACT_SCORE or (
+        score >= IMMEDIATE_ALERT_MIN_IMPACT
+        and confidence >= IMMEDIATE_ALERT_MIN_CONFIDENCE
+    )
 
 
 def is_overnight_window(now: Optional[datetime] = None) -> bool:
@@ -599,9 +620,7 @@ def digest_date_key(now: Optional[datetime] = None) -> str:
     return localized_now(LOCAL_TIMEZONE, now).date().isoformat()
 
 
-def fetch_overnight_digest_rows(supabase: Client, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    end = localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0)
-    start = end - timedelta(hours=DIGEST_LOOKBACK_HOURS)
+def fetch_digest_rows_between(supabase: Client, start: datetime, end: datetime, label: str) -> List[Dict[str, Any]]:
     try:
         response = (
             supabase.table("insights")
@@ -618,8 +637,20 @@ def fetch_overnight_digest_rows(supabase: Client, now: Optional[datetime] = None
         )
         return list(response.data or [])
     except Exception:
-        logger.exception("Failed to fetch overnight digest rows")
+        logger.exception("Failed to fetch %s digest rows", label)
         raise
+
+
+def fetch_overnight_digest_rows(supabase: Client, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    end = localized_now(LOCAL_TIMEZONE, now).replace(hour=8, minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=DIGEST_LOOKBACK_HOURS)
+    return fetch_digest_rows_between(supabase, start, end, "overnight")
+
+
+def fetch_power_hour_digest_rows(supabase: Client, now: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    end = localized_now(LOCAL_TIMEZONE, now).replace(hour=2, minute=30, second=0, microsecond=0)
+    start = end - timedelta(hours=POWER_HOUR_DIGEST_LOOKBACK_HOURS)
+    return fetch_digest_rows_between(supabase, start, end, "power_hour")
 
 
 def row_to_group_record(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -853,7 +884,7 @@ def build_study_only_signal_message(
     )
     return f"""
 <b>Study-only 市場訊號 {index}/{total}</b>
-<b>狀態：</b>Quiet Mode 已收錄，未即時 Telegram
+<b>狀態：</b>已收錄至 Study/Digest，未達即時 Telegram 門檻
 <b>整合：</b>{len(group)} 條相近 post
 <b>來源：</b>{html.escape(sources)}
 <b>Impact：</b>{int(merged.get('impact_score', 0))}/10 · <b>Confidence：</b>{int(merged.get('confidence_score', 0))}/10
@@ -899,10 +930,12 @@ def archive_study_only_signals(
         )
 
 
-def build_overnight_digest_message(groups: List[List[Dict[str, Any]]], now: Optional[datetime] = None) -> str:
-    current = localized_now(LOCAL_TIMEZONE, now)
-    end = current.replace(hour=8, minute=0, second=0, microsecond=0)
-    start = end - timedelta(hours=DIGEST_LOOKBACK_HOURS)
+def build_digest_message(
+    title: str,
+    groups: List[List[Dict[str, Any]]],
+    start: datetime,
+    end: datetime,
+) -> str:
     ranked = sorted(
         groups,
         key=lambda group: (
@@ -914,7 +947,7 @@ def build_overnight_digest_message(groups: List[List[Dict[str, Any]]], now: Opti
     )[:MAX_DIGEST_EVENTS]
 
     lines = [
-        "<b>━━ Overnight Market Digest ━━</b>",
+        f"<b>━━ {html.escape(title)} ━━</b>",
         f"<b>時段：</b>{html.escape(start.strftime('%Y-%m-%d %H:%M'))}-{html.escape(end.strftime('%H:%M'))} HKT",
         f"<b>整合事件：</b>{len(ranked)} / <b>原始訊號：</b>{sum(len(group) for group in groups)}",
     ]
@@ -935,6 +968,20 @@ def build_overnight_digest_message(groups: List[List[Dict[str, Any]]], now: Opti
         ])
 
     return "\n".join(lines)
+
+
+def build_overnight_digest_message(groups: List[List[Dict[str, Any]]], now: Optional[datetime] = None) -> str:
+    current = localized_now(LOCAL_TIMEZONE, now)
+    end = current.replace(hour=8, minute=0, second=0, microsecond=0)
+    start = end - timedelta(hours=DIGEST_LOOKBACK_HOURS)
+    return build_digest_message("Overnight Market Digest", groups, start, end)
+
+
+def build_power_hour_digest_message(groups: List[List[Dict[str, Any]]], now: Optional[datetime] = None) -> str:
+    current = localized_now(LOCAL_TIMEZONE, now)
+    end = current.replace(hour=2, minute=30, second=0, microsecond=0)
+    start = end - timedelta(hours=POWER_HOUR_DIGEST_LOOKBACK_HOURS)
+    return build_digest_message("Midday / Power Hour Prep", groups, start, end)
 
 
 def send_overnight_digest_if_due(supabase: Client, now: Optional[datetime] = None) -> None:
@@ -990,6 +1037,64 @@ def send_overnight_digest_if_due(supabase: Client, now: Optional[datetime] = Non
     )
     save_state_value(supabase, LAST_DIGEST_DATE_KEY, today_key)
     logger.info("Overnight digest sent date=%s rows=%s groups=%s", today_key, len(rows), len(groups))
+
+
+def send_power_hour_digest_if_due(supabase: Client, now: Optional[datetime] = None) -> None:
+    if not should_send_power_hour_digest(now):
+        return
+
+    today_key = digest_date_key(now)
+    if fetch_state_value(supabase, LAST_POWER_HOUR_DIGEST_DATE_KEY) == today_key:
+        logger.info("Power Hour digest already sent for %s", today_key)
+        return
+
+    current = localized_now(LOCAL_TIMEZONE, now)
+    end = current.replace(hour=2, minute=30, second=0, microsecond=0)
+    start = end - timedelta(hours=POWER_HOUR_DIGEST_LOOKBACK_HOURS)
+    rows = fetch_power_hour_digest_rows(supabase, now)
+    records = [row_to_group_record(row) for row in rows]
+    if not records:
+        message = "<b>━━ Midday / Power Hour Prep ━━</b>\n過去時段暫時未有高衝擊訊號。"
+        post_telegram_message(message, disable_preview=True)
+        archive_telegram_alert(
+            supabase,
+            "power_hour_digest",
+            "Midday / Power Hour Prep",
+            message,
+            session_id=f"power-hour-{today_key}",
+            metadata={
+                "period_start": start.astimezone(timezone.utc).isoformat(),
+                "period_end": end.astimezone(timezone.utc).isoformat(),
+            },
+            refresh_study=True,
+        )
+        save_state_value(supabase, LAST_POWER_HOUR_DIGEST_DATE_KEY, today_key)
+        return
+
+    groups = group_high_impact_records(records)
+    message = build_power_hour_digest_message(groups, now)
+    post_telegram_message(message, disable_preview=True)
+    metadata = {
+        "period_start": start.astimezone(timezone.utc).isoformat(),
+        "period_end": end.astimezone(timezone.utc).isoformat(),
+        "insight_ids": [str(row.get("tweet_id")) for row in rows if row.get("tweet_id")],
+        "source_tweet_urls": [str(row.get("tweet_url")) for row in rows if row.get("tweet_url")],
+        "impact_max": max((int(row.get("impact_score") or 0) for row in rows), default=0) or None,
+        "confidence_avg": round(sum(int(row.get("confidence_score") or 0) for row in rows) / len(rows), 2) if rows else None,
+        "tickers": sorted({str(ticker).upper() for row in rows for ticker in (row.get("affected_tickers") or []) if str(ticker).strip()}),
+        "sectors": sorted({str(sector) for row in rows for sector in (row.get("target_sectors") or []) if str(sector).strip()}),
+    }
+    archive_telegram_alert(
+        supabase,
+        "power_hour_digest",
+        "Midday / Power Hour Prep",
+        message,
+        session_id=f"power-hour-{today_key}",
+        metadata=metadata,
+        refresh_study=True,
+    )
+    save_state_value(supabase, LAST_POWER_HOUR_DIGEST_DATE_KEY, today_key)
+    logger.info("Power Hour digest sent date=%s rows=%s groups=%s", today_key, len(rows), len(groups))
 
 
 def extract_apify_run_id(response_text: str) -> Optional[str]:
@@ -1712,6 +1817,7 @@ def main() -> int:
         processed_tweet_ids = fetch_processed_tweet_ids(supabase)
         recent_events = fetch_recent_event_fingerprints(supabase)
         send_overnight_digest_if_due(supabase)
+        send_power_hour_digest_if_due(supabase)
         if os.getenv("SELF_TEST_MODE", "").lower() in {"1", "true", "yes"}:
             run_self_test(supabase)
             return 0
@@ -1813,32 +1919,23 @@ def main() -> int:
 
     if high_impact_records:
         try:
-            quiet_mode = is_hkt_quiet_window()
             telegram_records = [
                 record for record in high_impact_records
-                if not quiet_mode
-                or (
-                    int(record["insight"].get("impact_score", 0)) >= QUIET_IMMEDIATE_IMPACT_SCORE
-                    and int(record["insight"].get("confidence_score", 0)) >= QUIET_IMMEDIATE_CONFIDENCE_SCORE
-                )
+                if is_immediate_telegram_alert(record["insight"])
             ]
             telegram_tweet_ids = {record["tweet"]["tweet_id"] for record in telegram_records}
             study_only_records = [
                 record for record in high_impact_records
-                if quiet_mode and record["tweet"]["tweet_id"] not in telegram_tweet_ids
+                if record["tweet"]["tweet_id"] not in telegram_tweet_ids
             ]
             session_id = f"alerts-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
             if study_only_records:
                 study_groups = group_high_impact_records(study_only_records)
                 study_merged = [synthesize_group_insight(openai_client, group) for group in study_groups]
                 archive_study_only_signals(supabase, study_groups, study_merged, session_id)
-                logger.info(
-                    "Quiet mode archived %s high-impact records as %s study-only groups",
-                    len(study_only_records),
-                    len(study_groups),
-                )
+                logger.info("Archived %s non-immediate high-impact records as %s study-only groups", len(study_only_records), len(study_groups))
             if not telegram_records:
-                logger.info("Quiet mode suppressed %s high-impact Telegram alerts", len(high_impact_records))
+                logger.info("No high-impact records met immediate Telegram threshold impact>=%s confidence>=%s or critical impact>=%s", IMMEDIATE_ALERT_MIN_IMPACT, IMMEDIATE_ALERT_MIN_CONFIDENCE, CRITICAL_ALERT_IMPACT_SCORE)
                 groups = []
             else:
                 groups = group_high_impact_records(telegram_records)

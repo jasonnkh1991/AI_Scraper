@@ -125,8 +125,20 @@ class AlertGroupingTest(unittest.TestCase):
         message = crawler.build_study_only_signal_message(group, merged, 1, 1)
 
         self.assertIn("Study-only 市場訊號", message)
-        self.assertIn("Quiet Mode 已收錄", message)
+        self.assertIn("已收錄至 Study/Digest", message)
         self.assertIn("https://x.com/source/status/1", message)
+
+    def test_immediate_telegram_threshold(self) -> None:
+        self.assertTrue(crawler.is_immediate_telegram_alert({"impact_score": 8, "confidence_score": 7}))
+        self.assertFalse(crawler.is_immediate_telegram_alert({"impact_score": 8, "confidence_score": 6}))
+        self.assertTrue(crawler.is_immediate_telegram_alert({"impact_score": 9, "confidence_score": 3}))
+
+    def test_power_hour_digest_message_title(self) -> None:
+        group = [record("1", "Snowflake AWS AI compute deal", ["SNOW", "AMZN"])]
+        message = crawler.build_power_hour_digest_message([group])
+
+        self.assertIn("Midday / Power Hour Prep", message)
+        self.assertIn("來源：", message)
 
 
 if __name__ == "__main__":
