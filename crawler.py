@@ -38,6 +38,13 @@ PRIORITY_AI_PROCESS_LIMIT = int(os.getenv("PRIORITY_AI_PROCESS_LIMIT", "25"))
 NORMAL_AI_PROCESS_LIMIT = int(os.getenv("NORMAL_AI_PROCESS_LIMIT", "10"))
 STALE_PENDING_HOURS = int(os.getenv("STALE_PENDING_HOURS", "18"))
 STALE_PRIORITY_KEEP_SCORE = int(os.getenv("STALE_PRIORITY_KEEP_SCORE", "40"))
+QUEUE_PROCESSED_RETENTION_DAYS = int(os.getenv("QUEUE_PROCESSED_RETENTION_DAYS", "7"))
+QUEUE_STALE_RETENTION_DAYS = int(os.getenv("QUEUE_STALE_RETENTION_DAYS", "3"))
+QUEUE_FAILED_RETENTION_DAYS = int(os.getenv("QUEUE_FAILED_RETENTION_DAYS", "14"))
+INSIGHTS_RETENTION_DAYS = int(os.getenv("INSIGHTS_RETENTION_DAYS", "90"))
+CLUSTERS_RETENTION_DAYS = int(os.getenv("CLUSTERS_RETENTION_DAYS", "180"))
+TELEGRAM_ALERTS_RETENTION_DAYS = int(os.getenv("TELEGRAM_ALERTS_RETENTION_DAYS", "180"))
+DAILY_BRIEFS_RETENTION_DAYS = int(os.getenv("DAILY_BRIEFS_RETENTION_DAYS", "365"))
 LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "Asia/Hong_Kong")
 STATE_KEY = "last_processed_tweet_id"
 PROCESSED_TWEET_IDS_KEY = "processed_tweet_ids"
@@ -805,6 +812,71 @@ def fetch_queue_backlog_count(supabase: Client) -> int:
     except Exception:
         logger.exception("Failed to count pending tweet_queue rows")
         return -1
+
+
+def retention_cutoff(days: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+def cleanup_table_before(
+    supabase: Client,
+    table_name: str,
+    timestamp_column: str,
+    cutoff_iso: str,
+    filters: Optional[List[Tuple[str, str, Any]]] = None,
+) -> int:
+    query = supabase.table(table_name).delete().lt(timestamp_column, cutoff_iso)
+    for operator, column, value in filters or []:
+        if operator == "eq":
+            query = query.eq(column, value)
+        elif operator == "neq":
+            query = query.neq(column, value)
+        else:
+            raise ValueError(f"Unsupported cleanup filter operator: {operator}")
+    response = query.execute()
+    return len(response.data or []) if getattr(response, "data", None) is not None else 0
+
+
+def cleanup_old_records(supabase: Client) -> Dict[str, int]:
+    cleanup_plan = [
+        (
+            "tweet_queue_stale",
+            "tweet_queue",
+            "stale_processed_at",
+            retention_cutoff(QUEUE_STALE_RETENTION_DAYS),
+            [("eq", "is_stale", True), ("eq", "status", "processed")],
+        ),
+        (
+            "tweet_queue_processed",
+            "tweet_queue",
+            "processed_at",
+            retention_cutoff(QUEUE_PROCESSED_RETENTION_DAYS),
+            [("eq", "status", "processed"), ("eq", "is_stale", False)],
+        ),
+        (
+            "tweet_queue_failed",
+            "tweet_queue",
+            "updated_at",
+            retention_cutoff(QUEUE_FAILED_RETENTION_DAYS),
+            [("eq", "status", "failed")],
+        ),
+        ("insights", "insights", "inserted_at", retention_cutoff(INSIGHTS_RETENTION_DAYS), None),
+        ("event_clusters", "event_clusters", "last_seen_at", retention_cutoff(CLUSTERS_RETENTION_DAYS), None),
+        ("telegram_alerts", "telegram_alerts", "created_at", retention_cutoff(TELEGRAM_ALERTS_RETENTION_DAYS), None),
+        ("daily_study_briefs", "daily_study_briefs", "study_date", (localized_now(LOCAL_TIMEZONE).date() - timedelta(days=DAILY_BRIEFS_RETENTION_DAYS)).isoformat(), None),
+    ]
+    deleted: Dict[str, int] = {}
+    for label, table_name, timestamp_column, cutoff_iso, filters in cleanup_plan:
+        try:
+            count = cleanup_table_before(supabase, table_name, timestamp_column, cutoff_iso, filters)
+            deleted[label] = count
+            if count:
+                logger.info("Cleanup deleted %s rows from %s before %s", count, label, cutoff_iso)
+        except Exception:
+            deleted[label] = -1
+            logger.warning("Cleanup skipped for %s", label, exc_info=True)
+    logger.info("Cleanup summary: %s", deleted)
+    return deleted
 
 
 def digest_date_key(now: Optional[datetime] = None) -> str:
@@ -2394,6 +2466,7 @@ def main() -> int:
 
     try:
         supabase = get_supabase()
+        cleanup_old_records(supabase)
         processed_tweet_ids = fetch_processed_tweet_ids(supabase)
         recent_events = fetch_recent_event_fingerprints(supabase)
         send_overnight_digest_if_due(supabase)

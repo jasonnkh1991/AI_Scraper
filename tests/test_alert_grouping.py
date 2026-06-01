@@ -217,5 +217,52 @@ class AlertGroupingTest(unittest.TestCase):
         self.assertIn("Vera Rubin", message)
 
 
+    def test_cleanup_old_records_uses_safe_filters(self) -> None:
+        class FakeResponse:
+            data = []
+
+        class FakeQuery:
+            def __init__(self, calls, table_name):
+                self.calls = calls
+                self.table_name = table_name
+
+            def delete(self):
+                self.calls.append((self.table_name, "delete"))
+                return self
+
+            def lt(self, column, value):
+                self.calls.append((self.table_name, "lt", column, value))
+                return self
+
+            def eq(self, column, value):
+                self.calls.append((self.table_name, "eq", column, value))
+                return self
+
+            def neq(self, column, value):
+                self.calls.append((self.table_name, "neq", column, value))
+                return self
+
+            def execute(self):
+                self.calls.append((self.table_name, "execute"))
+                return FakeResponse()
+
+        class FakeSupabase:
+            def __init__(self):
+                self.calls = []
+
+            def table(self, table_name):
+                return FakeQuery(self.calls, table_name)
+
+        fake = FakeSupabase()
+
+        deleted = crawler.cleanup_old_records(fake)
+
+        self.assertEqual(deleted["tweet_queue_stale"], 0)
+        self.assertIn(("tweet_queue", "eq", "status", "processed"), fake.calls)
+        self.assertIn(("tweet_queue", "eq", "is_stale", True), fake.calls)
+        self.assertIn(("tweet_queue", "eq", "is_stale", False), fake.calls)
+        self.assertNotIn(("tweet_queue", "eq", "status", "pending"), fake.calls)
+
+
 if __name__ == "__main__":
     unittest.main()
