@@ -82,7 +82,8 @@ class AlertGroupingTest(unittest.TestCase):
         group = [record("1", "Snowflake AWS AI compute deal", ["SNOW", "AMZN"])]
         message = crawler.build_overnight_digest_message([group])
 
-        self.assertIn("Overnight Market Digest", message)
+        self.assertIn("AI MARKET DIGEST | OVERNIGHT MARKET DIGEST", message)
+        self.assertIn("用途：", message)
         self.assertIn("來源：", message)
         self.assertIn("https://x.com/source/status/1", message)
         self.assertIn("@source", message)
@@ -137,7 +138,7 @@ class AlertGroupingTest(unittest.TestCase):
         group = [record("1", "Snowflake AWS AI compute deal", ["SNOW", "AMZN"])]
         message = crawler.build_power_hour_digest_message([group])
 
-        self.assertIn("Midday / Power Hour Prep", message)
+        self.assertIn("AI MARKET DIGEST | MIDDAY / POWER HOUR PREP", message)
         self.assertIn("來源：", message)
 
     def test_event_cluster_payload_merges_sources(self) -> None:
@@ -180,7 +181,7 @@ class AlertGroupingTest(unittest.TestCase):
         groups = crawler.cluster_rows_to_groups(rows)
         message = crawler.build_premarket_digest_message(groups)
 
-        self.assertIn("Pre-Market Brief", message)
+        self.assertIn("AI MARKET DIGEST | PRE-MARKET BRIEF", message)
         self.assertIn("SNOW", message)
         self.assertIn("https://x.com/source/status/1", message)
 
@@ -189,7 +190,7 @@ class AlertGroupingTest(unittest.TestCase):
             "author_handle": "business",
             "author_name": "Bloomberg Business",
             "tweet_text": "Nvidia's Jensen Huang discusses Vera Rubin and a new AI chip at Computex. $NVDA",
-            "tweet_created_at": "2026-06-01T04:28:57+00:00",
+            "tweet_created_at": crawler.datetime.now(crawler.timezone.utc).isoformat(),
         })
 
         self.assertGreaterEqual(score, 50)
@@ -212,7 +213,8 @@ class AlertGroupingTest(unittest.TestCase):
             }],
         )
 
-        self.assertIn("High-priority pending", message)
+        self.assertIn("AI MARKET DIGEST | TEST DIGEST", message)
+        self.assertIn("<b>Pending：</b>1", message)
         self.assertIn("待分析但值得跟進", message)
         self.assertIn("Vera Rubin", message)
 

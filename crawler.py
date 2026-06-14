@@ -1671,6 +1671,37 @@ def archive_study_only_signals(
         )
 
 
+
+def digest_display_name(title: str) -> str:
+    mapping = {
+        "Overnight Market Digest": "OVERNIGHT MARKET DIGEST",
+        "Midday / Power Hour Prep": "MIDDAY / POWER HOUR PREP",
+        "Pre-Market Brief": "PRE-MARKET BRIEF",
+        "Market Open Recap": "MARKET OPEN RECAP",
+    }
+    return mapping.get(title, title.upper())
+
+
+def build_digest_header(
+    title: str,
+    start: datetime,
+    end: datetime,
+    confirmed_count: int,
+    raw_signal_count: int,
+    pending_count: int,
+) -> str:
+    display_name = digest_display_name(title)
+    return "\n".join([
+        "<b>■■■■■■■■■■■■■■■■</b>",
+        f"<b>AI MARKET DIGEST | {html.escape(display_name)}</b>",
+        "<b>■■■■■■■■■■■■■■■■</b>",
+        f"<b>Date：</b>{html.escape(start.strftime('%Y-%m-%d'))} HKT",
+        f"<b>Window：</b>{html.escape(start.strftime('%H:%M'))}-{html.escape(end.strftime('%H:%M'))}",
+        f"<b>Confirmed：</b>{confirmed_count} clusters · <b>Raw：</b>{raw_signal_count} signals · <b>Pending：</b>{pending_count}",
+        "<b>用途：</b>固定時段重點回顧，不是即時單條 alert",
+    ])
+
+
 def build_digest_message(
     title: str,
     groups: List[List[Dict[str, Any]]],
@@ -1690,10 +1721,14 @@ def build_digest_message(
     )[:MAX_DIGEST_EVENTS]
 
     lines = [
-        f"<b>━━ {html.escape(title)} ━━</b>",
-        f"<b>時段：</b>{html.escape(start.strftime('%Y-%m-%d %H:%M'))}-{html.escape(end.strftime('%H:%M'))} HKT",
-        f"<b>整合事件：</b>{len(ranked)} / <b>原始訊號：</b>{sum(len(group) for group in groups)}",
-        f"<b>High-priority pending：</b>{len(pending_rows)}",
+        build_digest_header(
+            title,
+            start,
+            end,
+            confirmed_count=len(ranked),
+            raw_signal_count=sum(len(group) for group in groups),
+            pending_count=len(pending_rows),
+        )
     ]
 
     for idx, group in enumerate(ranked, start=1):
@@ -1798,12 +1833,15 @@ def synthesize_digest_message(
         content = completion.choices[0].message.content or ""
         if not content.strip():
             return fallback
-        header = (
-            f"<b>━━ {html.escape(title)} ━━</b>\n"
-            f"<b>時段：</b>{html.escape(start.strftime('%Y-%m-%d %H:%M'))}-{html.escape(end.strftime('%H:%M'))} HKT\n"
-            f"<b>Confirmed clusters：</b>{len(groups)} · <b>High-priority pending：</b>{len(pending_rows)}\n\n"
+        header = build_digest_header(
+            title,
+            start,
+            end,
+            confirmed_count=len(groups),
+            raw_signal_count=sum(len(group) for group in groups),
+            pending_count=len(pending_rows),
         )
-        return header + html.escape(content.strip())
+        return header + "\n\n" + html.escape(content.strip())
     except Exception:
         logger.warning("Digest synthesis failed; using deterministic fallback", exc_info=True)
         return fallback
@@ -1851,7 +1889,7 @@ def send_overnight_digest_if_due(supabase: Client, now: Optional[datetime] = Non
     start = end - timedelta(hours=DIGEST_LOOKBACK_HOURS)
     pending_rows = fetch_digest_pending_rows(supabase, start, end)
     if not rows and not pending_rows:
-        message = f"<b>━━ Overnight Market Digest ━━</b>\n今日 HKT 00:00-08:00 暫時未有高衝擊訊號。"
+        message = build_digest_header("Overnight Market Digest", start, end, 0, 0, 0) + "\n\n今日 HKT 00:00-08:00 暫時未有高衝擊訊號。"
         post_telegram_message(message, disable_preview=True)
         archive_telegram_alert(
             supabase,
@@ -1900,7 +1938,7 @@ def send_power_hour_digest_if_due(supabase: Client, now: Optional[datetime] = No
     rows = fetch_power_hour_digest_rows(supabase, now)
     pending_rows = fetch_digest_pending_rows(supabase, start, end)
     if not rows and not pending_rows:
-        message = "<b>━━ Midday / Power Hour Prep ━━</b>\n過去時段暫時未有高衝擊訊號。"
+        message = build_digest_header("Midday / Power Hour Prep", start, end, 0, 0, 0) + "\n\n過去時段暫時未有高衝擊訊號。"
         post_telegram_message(message, disable_preview=True)
         archive_telegram_alert(
             supabase,
@@ -1949,7 +1987,7 @@ def send_premarket_digest_if_due(supabase: Client, now: Optional[datetime] = Non
     rows = fetch_premarket_digest_rows(supabase, now)
     pending_rows = fetch_digest_pending_rows(supabase, start, end)
     if not rows and not pending_rows:
-        message = "<b>━━ Pre-Market Brief ━━</b>\n美股開市前暫時未有新高衝擊 cluster。"
+        message = build_digest_header("Pre-Market Brief", start, end, 0, 0, 0) + "\n\n美股開市前暫時未有新高衝擊 cluster。"
         post_telegram_message(message, disable_preview=True)
         archive_telegram_alert(
             supabase,
@@ -1994,7 +2032,7 @@ def send_market_open_digest_if_due(supabase: Client, now: Optional[datetime] = N
     rows = fetch_market_open_digest_rows(supabase, now)
     pending_rows = fetch_digest_pending_rows(supabase, start, end)
     if not rows and not pending_rows:
-        message = "<b>━━ Market Open Recap ━━</b>\n美股開市後暫時未有新高衝擊 cluster。"
+        message = build_digest_header("Market Open Recap", start, end, 0, 0, 0) + "\n\n美股開市後暫時未有新高衝擊 cluster。"
         post_telegram_message(message, disable_preview=True)
         archive_telegram_alert(
             supabase,
