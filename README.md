@@ -76,3 +76,28 @@ TRUTH_SOCIAL_RUN_MINUTES=60
 Truth Social posts are normalized into the same insight pipeline with IDs like `truth-<post_id>` and author handle `truth:realDonaldTrump`.
 
 Cost note: this actor currently charges per actor start plus per result, so it is intentionally throttled to once per hour by default.
+
+## Polymarket Probability Radar
+
+This is an additive pipeline. It does not replace or modify the X/Twitter crawler.
+
+Files:
+
+- `polymarket_monitor.py` - pulls Polymarket public Gamma API data, discovers investment-relevant markets, stores compact snapshots, detects probability shocks, and sends Telegram alerts.
+- `.github/workflows/polymarket.yml` - runs the Polymarket radar every 15 minutes.
+- `/polymarket` - dashboard page for active markets and probability-shock signals.
+
+Required setup:
+
+1. Run the `polymarket_*` SQL blocks in `supabase/schema.sql` in Supabase SQL Editor.
+2. No Polymarket API key is required.
+3. Reuse existing GitHub Secrets: `SUPABASE_URL`, `SUPABASE_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
+4. Run GitHub Actions workflow `Monitor Polymarket` manually once. First run may only create snapshots; signals normally require at least two snapshots to compare probability moves.
+
+Cost controls:
+
+- `POLYMARKET_MAX_ACTIVE_MARKETS=60`
+- `POLYMARKET_SNAPSHOT_RETENTION_DAYS=14`
+- `POLYMARKET_APIFY_FALLBACK_ENABLED=false`
+
+The radar uses public Polymarket APIs by default. Apify fallback is intentionally disabled in MVP to avoid unexpected Apify spend.
