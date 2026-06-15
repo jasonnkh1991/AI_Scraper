@@ -420,8 +420,11 @@ def collect_snapshots(supabase: Client, discovered: Dict[str, Dict[str, Any]]) -
         updates.append({"market_id": row["market_id"], "last_snapshot_at": now_iso, "updated_at": now_iso})
     if snapshots:
         supabase.table("polymarket_snapshots").insert(snapshots).execute()
-    if updates:
-        supabase.table("polymarket_markets").upsert(updates, on_conflict="market_id").execute()
+    for update in updates:
+        supabase.table("polymarket_markets").update({
+            "last_snapshot_at": update["last_snapshot_at"],
+            "updated_at": update["updated_at"],
+        }).eq("market_id", update["market_id"]).execute()
     logger.info("Inserted %s Polymarket snapshots", len(snapshots))
     return snapshots
 

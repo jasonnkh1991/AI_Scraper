@@ -215,6 +215,7 @@ export default async function StudyPage({ searchParams }: { searchParams: Search
             <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href="/">Signals</Link>
             <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href={`/alerts?date=${selectedDate}`}>Alerts</Link>
             <Link className="border border-violet-500/50 bg-violet-950/30 px-3 py-2 text-violet-100" href={`/study?date=${selectedDate}`}>Study</Link>
+            <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href="/polymarket">Polymarket</Link>
           </nav>
         </header>
 

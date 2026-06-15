@@ -112,6 +112,7 @@ export default async function AlertsPage({ searchParams }: { searchParams: Searc
             <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href="/">Signals</Link>
             <Link className="border border-cyan-500/50 bg-cyan-950/30 px-3 py-2 text-cyan-100" href={`/alerts?date=${selectedDate}`}>Alerts</Link>
             <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href={`/study?date=${selectedDate}`}>Study</Link>
+            <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href="/polymarket">Polymarket</Link>
           </nav>
         </header>
 

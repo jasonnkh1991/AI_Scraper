@@ -141,6 +141,9 @@ export default async function DashboardPage() {
               <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href="/study">
                 Study
               </Link>
+              <Link className="border border-zinc-700 px-3 py-2 text-zinc-200 hover:bg-zinc-900" href="/polymarket">
+                Polymarket
+              </Link>
             </nav>
 
             <div className="grid grid-cols-3 gap-2 text-right sm:min-w-[420px]">
