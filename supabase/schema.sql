@@ -218,6 +218,7 @@ create table if not exists public.polymarket_markets (
   event_id text,
   slug text,
   question text not null,
+  question_zh text,
   category text,
   tags text[] not null default '{}',
   source text not null default 'manual',
@@ -236,7 +237,8 @@ create table if not exists public.polymarket_markets (
 );
 
 alter table public.polymarket_markets
-  add column if not exists source_url text;
+  add column if not exists source_url text,
+  add column if not exists question_zh text;
 
 create index if not exists polymarket_markets_active_idx
   on public.polymarket_markets (active, closed, watch_priority desc, discovery_score desc);
@@ -271,6 +273,7 @@ create table if not exists public.polymarket_signals (
   signal_key text not null unique,
   market_id text not null,
   question text not null,
+  question_zh text,
   signal_type text not null,
   old_probability numeric,
   new_probability numeric,
@@ -290,7 +293,8 @@ create table if not exists public.polymarket_signals (
 
 alter table public.polymarket_signals
   add column if not exists signal_key text,
-  add column if not exists trading_lens_zh text;
+  add column if not exists trading_lens_zh text,
+  add column if not exists question_zh text;
 
 create unique index if not exists polymarket_signals_signal_key_idx
   on public.polymarket_signals (signal_key);

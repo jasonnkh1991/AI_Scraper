@@ -32,6 +32,12 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+          DIGEST_API_KEY: ${{ secrets.DIGEST_API_KEY }}
+          DIGEST_BASE_URL: ${{ secrets.DIGEST_BASE_URL }}
+          DIGEST_MODEL: ${{ secrets.DIGEST_MODEL }}
           POLYMARKET_ENABLED: "true"
           POLYMARKET_DISCOVERY_ENABLED: "true"
           POLYMARKET_EXTERNAL_DISCOVERY_ENABLED: "true"
@@ -45,6 +51,10 @@ jobs:
           POLYMARKET_SIGNAL_MIN_MOVE_6H: "0.20"
           POLYMARKET_SIGNAL_MIN_MOVE_24H: "0.30"
           POLYMARKET_SIGNAL_MIN_QUALITY: "70"
+          POLYMARKET_TRANSLATION_ENABLED: "true"
+          POLYMARKET_TRANSLATION_MODEL: ${{ secrets.DIGEST_MODEL || secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
+          POLYMARKET_TRANSLATION_BASE_URL: ${{ secrets.DIGEST_BASE_URL || secrets.OPENAI_BASE_URL }}
+          POLYMARKET_TRANSLATION_API_KEY: ${{ secrets.DIGEST_API_KEY || secrets.OPENAI_API_KEY }}
           POLYMARKET_SNAPSHOT_RETENTION_DAYS: "14"
           POLYMARKET_SIGNAL_RETENTION_DAYS: "180"
         run: python polymarket_monitor.py

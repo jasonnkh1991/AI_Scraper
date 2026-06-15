@@ -35,7 +35,18 @@ POLYMARKET_SIGNAL_MIN_QUALITY = int(os.getenv("POLYMARKET_SIGNAL_MIN_QUALITY", "
 POLYMARKET_SNAPSHOT_RETENTION_DAYS = int(os.getenv("POLYMARKET_SNAPSHOT_RETENTION_DAYS", "14"))
 POLYMARKET_SIGNAL_RETENTION_DAYS = int(os.getenv("POLYMARKET_SIGNAL_RETENTION_DAYS", "180"))
 POLYMARKET_TELEGRAM_ENABLED = os.getenv("POLYMARKET_TELEGRAM_ENABLED", "true").lower() in {"1", "true", "yes"}
+POLYMARKET_TRANSLATION_ENABLED = os.getenv("POLYMARKET_TRANSLATION_ENABLED", "true").lower() in {"1", "true", "yes"}
+POLYMARKET_TRANSLATION_MODEL = os.getenv("POLYMARKET_TRANSLATION_MODEL") or os.getenv("DIGEST_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+POLYMARKET_TRANSLATION_BASE_URL = (
+    os.getenv("POLYMARKET_TRANSLATION_BASE_URL")
+    or os.getenv("DIGEST_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+    or "https://api.openai.com/v1"
+).rstrip("/")
+POLYMARKET_TRANSLATION_API_KEY = os.getenv("POLYMARKET_TRANSLATION_API_KEY") or os.getenv("DIGEST_API_KEY") or os.getenv("OPENAI_API_KEY")
+POLYMARKET_TITLE_TRANSLATION_CACHE_LIMIT = int(os.getenv("POLYMARKET_TITLE_TRANSLATION_CACHE_LIMIT", "300"))
 DYNAMIC_WATCH_TERMS_KEY = "dynamic_watch_terms"
+TITLE_TRANSLATIONS_STATE_KEY = "polymarket_title_translations"
 
 STATIC_DISCOVERY_KEYWORDS = [
     "fed", "fomc", "rate cut", "interest rates", "powell", "fed chair", "kevin hassett", "scott bessent",
@@ -271,6 +282,78 @@ def state_value(supabase: Client, key: str) -> Optional[str]:
     response = supabase.table("system_states").select("value").eq("key", key).limit(1).execute()
     rows = response.data or []
     return str(rows[0]["value"]) if rows else None
+
+
+def save_state_value(supabase: Client, key: str, value: str) -> None:
+    supabase.table("system_states").upsert({"key": key, "value": value}, on_conflict="key").execute()
+
+
+def chat_completions_url(base_url: str) -> str:
+    cleaned = base_url.rstrip("/")
+    return cleaned if cleaned.endswith("/chat/completions") else f"{cleaned}/chat/completions"
+
+
+def load_title_translation_cache(supabase: Client) -> Dict[str, Any]:
+    try:
+        data = json.loads(state_value(supabase, TITLE_TRANSLATIONS_STATE_KEY) or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Cannot read Polymarket title translation cache", exc_info=True)
+        return {}
+
+
+def save_title_translation_cache(supabase: Client, cache: Dict[str, Any]) -> None:
+    try:
+        items = list(cache.items())[-POLYMARKET_TITLE_TRANSLATION_CACHE_LIMIT:]
+        save_state_value(supabase, TITLE_TRANSLATIONS_STATE_KEY, json.dumps(dict(items), ensure_ascii=False))
+    except Exception:
+        logger.warning("Cannot save Polymarket title translation cache", exc_info=True)
+
+
+def translate_question_zh(supabase: Client, question: str) -> Optional[str]:
+    question = question.strip()
+    if not question or not POLYMARKET_TRANSLATION_ENABLED:
+        return None
+    cache = load_title_translation_cache(supabase)
+    cached = cache.get(question)
+    if isinstance(cached, dict) and cached.get("zh"):
+        return str(cached["zh"])
+    if not POLYMARKET_TRANSLATION_API_KEY:
+        logger.info("Polymarket title translation skipped: missing API key")
+        return None
+
+    try:
+        response = requests.post(
+            chat_completions_url(POLYMARKET_TRANSLATION_BASE_URL),
+            headers={
+                "Authorization": f"Bearer {POLYMARKET_TRANSLATION_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": POLYMARKET_TRANSLATION_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Translate Polymarket prediction-market titles into concise Traditional Chinese for Hong Kong investors. Preserve names, tickers, dates, numbers and odds context. Output only the Chinese translation.",
+                    },
+                    {"role": "user", "content": question},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 120,
+            },
+            timeout=15,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        translated = str(payload["choices"][0]["message"]["content"]).strip().strip('"')
+        if not translated:
+            return None
+        cache[question] = {"zh": translated, "model": POLYMARKET_TRANSLATION_MODEL, "updated_at": utcnow().isoformat()}
+        save_title_translation_cache(supabase, cache)
+        return translated
+    except Exception:
+        logger.warning("Polymarket title translation failed model=%s", POLYMARKET_TRANSLATION_MODEL, exc_info=True)
+        return None
 
 
 def dynamic_terms(supabase: Client) -> List[str]:
@@ -514,10 +597,17 @@ def detect_signals(supabase: Client, snapshots: List[Dict[str, Any]]) -> List[Di
                 continue
             bucket = now.replace(minute=(now.minute // 15) * 15, second=0, microsecond=0).isoformat()
             direction = "上升" if move > 0 else "下跌"
+            question_zh = translate_question_zh(supabase, question)
+            if question_zh:
+                try:
+                    supabase.table("polymarket_markets").update({"question_zh": question_zh, "updated_at": now.isoformat()}).eq("market_id", market_id).execute()
+                except Exception:
+                    logger.debug("Cannot update Polymarket market translation market_id=%s", market_id, exc_info=True)
             signals.append({
                 "signal_key": f"{market_id}:{signal_type}:{bucket}:{round(current_prob, 3)}",
                 "market_id": market_id,
                 "question": question,
+                "question_zh": question_zh,
                 "signal_type": signal_type,
                 "old_probability": round(old_prob, 4),
                 "new_probability": round(current_prob, 4),
@@ -561,12 +651,18 @@ def signal_message(signal: Dict[str, Any]) -> str:
     new_p = float(signal.get("new_probability") or 0)
     move = float(signal.get("probability_change") or 0)
     arrow = "▲" if move > 0 else "▼"
+    question = html.escape(str(signal.get("question") or ""))
+    question_zh = html.escape(str(signal.get("question_zh") or ""))
+    market_lines = ["<b>Market</b>：", f"EN：{question}"]
+    if question_zh:
+        market_lines.append(f"中：{question_zh}")
+
     return "\n".join([
         "■■■■■■■■■■■■■■■■",
         "<b>POLYMARKET SIGNAL | PROBABILITY SHOCK</b>",
         "■■■■■■■■■■■■■■■■",
         "",
-        f"<b>Market</b>：{html.escape(str(signal.get('question') or ''))}",
+        "\n".join(market_lines),
         f"<b>Move</b>：{old_p:.0%} → {new_p:.0%} ({arrow}{abs(move):.0%}, {html.escape(str(signal.get('signal_type') or ''))})",
         f"<b>Quality</b>：{signal.get('quality_score')}/100",
         "",
