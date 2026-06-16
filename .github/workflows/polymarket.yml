@@ -2,6 +2,17 @@ name: Monitor Polymarket
 
 on:
   workflow_dispatch:
+    inputs:
+      send_digest:
+        description: "Send the Polymarket market brief after the radar run"
+        required: false
+        type: boolean
+        default: false
+      force_digest:
+        description: "Bypass digest dedupe gate"
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "*/15 * * * *"
 
@@ -55,6 +66,16 @@ jobs:
           POLYMARKET_TRANSLATION_MODEL: ${{ secrets.DIGEST_MODEL || secrets.OPENAI_MODEL || 'gpt-4o-mini' }}
           POLYMARKET_TRANSLATION_BASE_URL: ${{ secrets.DIGEST_BASE_URL || secrets.OPENAI_BASE_URL }}
           POLYMARKET_TRANSLATION_API_KEY: ${{ secrets.DIGEST_API_KEY || secrets.OPENAI_API_KEY }}
+          POLYMARKET_DIGEST_ENABLED: ${{ github.event.inputs.send_digest || 'false' }}
+          POLYMARKET_DIGEST_FORCE: ${{ github.event.inputs.force_digest || 'false' }}
+          POLYMARKET_DIGEST_MODEL: ${{ secrets.DIGEST_MODEL || 'gemini-3-flash-preview' }}
+          POLYMARKET_DIGEST_BASE_URL: ${{ secrets.DIGEST_BASE_URL || secrets.OPENAI_BASE_URL }}
+          POLYMARKET_DIGEST_API_KEY: ${{ secrets.DIGEST_API_KEY || secrets.OPENAI_API_KEY }}
+          POLYMARKET_DIGEST_MAX_TOPICS: "5"
+          POLYMARKET_DIGEST_MARKETS_PER_TOPIC: "3"
+          POLYMARKET_DIGEST_MIN_VOLUME_24H: "1000"
+          POLYMARKET_DIGEST_MIN_LIQUIDITY: "2000"
+          POLYMARKET_DIGEST_DEDUPE_HOURS: "12"
           POLYMARKET_SNAPSHOT_RETENTION_DAYS: "14"
           POLYMARKET_SIGNAL_RETENTION_DAYS: "180"
         run: python polymarket_monitor.py

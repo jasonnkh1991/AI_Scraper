@@ -59,7 +59,70 @@ class PolymarketMonitorTests(unittest.TestCase):
             "source_url": "https://polymarket.com/event/test",
         })
         self.assertIn("EN：Will the Fed cut rates in September?", message)
-        self.assertIn("中：聯儲局會否在九月減息？", message)
+        self.assertIn("聯儲局會否在九月減息？", message)
+        self.assertNotIn("中：", message)
+
+    def test_topic_for_market_classifies_geo_energy(self):
+        self.assertEqual(
+            pm.topic_for_market("US-Iran diplomatic meeting by June 19"),
+            "Iran / Israel / Oil",
+        )
+
+    def test_digest_candidate_filters_meme_market(self):
+        self.assertFalse(pm.is_digest_candidate(
+            {"question": "Will bitcoin hit $1m before GTA VI?"},
+            {"yes_price": 0.49, "volume_24hr": 100000, "liquidity": 100000},
+        ))
+
+    def test_choose_digest_topics_limits_markets_per_topic(self):
+        original_limit = pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC
+        try:
+            pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC = 2
+            items = [
+                {"topic": "Rates / Fed", "score": 50, "market": {}, "snapshot": {}},
+                {"topic": "Rates / Fed", "score": 40, "market": {}, "snapshot": {}},
+                {"topic": "Rates / Fed", "score": 30, "market": {}, "snapshot": {}},
+            ]
+            topics = pm.choose_digest_topics(items)
+            self.assertEqual(len(topics), 1)
+            self.assertEqual(len(topics[0][1]), 2)
+        finally:
+            pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC = original_limit
+
+    def test_digest_message_explains_odds_and_omits_chinese_label(self):
+        message = pm.build_polymarket_digest_message(None, [(
+            "Rates / Fed",
+            [{
+                "market": {
+                    "market_id": "1",
+                    "question": "Will there be no change in Fed interest rates?",
+                    "question_zh": "聯儲局會否維持利率不變？",
+                    "source_url": "https://polymarket.com/event/test",
+                },
+                "snapshot": {"yes_price": 0.945, "volume_24hr": 120000, "liquidity": 50000},
+                "move_1h": None,
+                "move_24h": 0.01,
+                "move_7d": 0.02,
+                "score": 80,
+            }],
+        )])
+        self.assertIn("Odds = 市場隱含機率", message)
+        self.assertIn("Will there be no change in Fed interest rates?", message)
+        self.assertIn("聯儲局會否維持利率不變？", message)
+        self.assertNotIn("中：", message)
+
+    def test_send_telegram_chunked_splits_long_message(self):
+        sent = []
+        original = pm.send_telegram
+        try:
+            pm.send_telegram = sent.append
+            count = pm.send_telegram_chunked("a" * 10 + "\n\n" + "b" * 10, max_chars=15)
+            self.assertEqual(count, 2)
+            self.assertEqual(len(sent), 2)
+            self.assertIn("Part 1/2", sent[0])
+            self.assertIn("Part 2/2", sent[1])
+        finally:
+            pm.send_telegram = original
 
 
 if __name__ == "__main__":

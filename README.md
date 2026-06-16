@@ -379,6 +379,35 @@ schedule:
 
 GitHub cron is best-effort and can be delayed. For better punctuality, use cron-job.org to trigger `workflow_dispatch` through GitHub API.
 
+### Polymarket Daily Market Brief
+
+The 15-minute Polymarket workflow continues to run probability-shock detection. Daily market briefs are opt-in and are intended to be triggered by an external cron service such as cron-job.org through `workflow_dispatch`.
+
+Dispatch inputs:
+
+```json
+{
+  "ref": "main",
+  "inputs": {
+    "send_digest": "true",
+    "force_digest": "false"
+  }
+}
+```
+
+`send_digest=true` sends a dynamic Polymarket market brief after the normal radar run. `force_digest=true` bypasses the digest dedupe window and should only be used for manual testing.
+
+Digest env controls:
+
+```text
+POLYMARKET_DIGEST_MODEL=gemini-3-flash-preview
+POLYMARKET_DIGEST_MAX_TOPICS=5
+POLYMARKET_DIGEST_MARKETS_PER_TOPIC=3
+POLYMARKET_DIGEST_DEDUPE_HOURS=12
+```
+
+The digest ranks topics dynamically from active markets using volume, liquidity, odds moves, topic relevance, and event recency. It should not hardcode Iran/Fed/Crypto forever; if a topic goes quiet or resolves, it should naturally fall out of the brief.
+
 ## External Cron Option
 
 For cron-job.org, use GitHub workflow dispatch API.

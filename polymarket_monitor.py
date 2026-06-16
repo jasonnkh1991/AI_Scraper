@@ -4,8 +4,9 @@ import logging
 import math
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 import requests
 from supabase import Client, create_client
@@ -36,6 +37,21 @@ POLYMARKET_SNAPSHOT_RETENTION_DAYS = int(os.getenv("POLYMARKET_SNAPSHOT_RETENTIO
 POLYMARKET_SIGNAL_RETENTION_DAYS = int(os.getenv("POLYMARKET_SIGNAL_RETENTION_DAYS", "180"))
 POLYMARKET_TELEGRAM_ENABLED = os.getenv("POLYMARKET_TELEGRAM_ENABLED", "true").lower() in {"1", "true", "yes"}
 POLYMARKET_TRANSLATION_ENABLED = os.getenv("POLYMARKET_TRANSLATION_ENABLED", "true").lower() in {"1", "true", "yes"}
+POLYMARKET_DIGEST_ENABLED = os.getenv("POLYMARKET_DIGEST_ENABLED", "false").lower() in {"1", "true", "yes"}
+POLYMARKET_DIGEST_FORCE = os.getenv("POLYMARKET_DIGEST_FORCE", "false").lower() in {"1", "true", "yes"}
+POLYMARKET_DIGEST_MAX_TOPICS = int(os.getenv("POLYMARKET_DIGEST_MAX_TOPICS", "5"))
+POLYMARKET_DIGEST_MARKETS_PER_TOPIC = int(os.getenv("POLYMARKET_DIGEST_MARKETS_PER_TOPIC", "3"))
+POLYMARKET_DIGEST_MIN_VOLUME_24H = float(os.getenv("POLYMARKET_DIGEST_MIN_VOLUME_24H", "1000"))
+POLYMARKET_DIGEST_MIN_LIQUIDITY = float(os.getenv("POLYMARKET_DIGEST_MIN_LIQUIDITY", "2000"))
+POLYMARKET_DIGEST_DEDUPE_HOURS = int(os.getenv("POLYMARKET_DIGEST_DEDUPE_HOURS", "12"))
+POLYMARKET_DIGEST_MODEL = os.getenv("POLYMARKET_DIGEST_MODEL") or os.getenv("DIGEST_MODEL") or os.getenv("OPENAI_MODEL") or "gemini-3-flash-preview"
+POLYMARKET_DIGEST_BASE_URL = (
+    os.getenv("POLYMARKET_DIGEST_BASE_URL")
+    or os.getenv("DIGEST_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+    or "https://api.openai.com/v1"
+).rstrip("/")
+POLYMARKET_DIGEST_API_KEY = os.getenv("POLYMARKET_DIGEST_API_KEY") or os.getenv("DIGEST_API_KEY") or os.getenv("OPENAI_API_KEY")
 POLYMARKET_TRANSLATION_MODEL = os.getenv("POLYMARKET_TRANSLATION_MODEL") or os.getenv("DIGEST_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 POLYMARKET_TRANSLATION_BASE_URL = (
     os.getenv("POLYMARKET_TRANSLATION_BASE_URL")
@@ -47,6 +63,8 @@ POLYMARKET_TRANSLATION_API_KEY = os.getenv("POLYMARKET_TRANSLATION_API_KEY") or 
 POLYMARKET_TITLE_TRANSLATION_CACHE_LIMIT = int(os.getenv("POLYMARKET_TITLE_TRANSLATION_CACHE_LIMIT", "300"))
 DYNAMIC_WATCH_TERMS_KEY = "dynamic_watch_terms"
 TITLE_TRANSLATIONS_STATE_KEY = "polymarket_title_translations"
+POLYMARKET_DIGEST_STATE_KEY = "polymarket_digest_last_sent_at"
+T = TypeVar("T")
 
 STATIC_DISCOVERY_KEYWORDS = [
     "fed", "fomc", "rate cut", "interest rates", "powell", "fed chair", "kevin hassett", "scott bessent",
@@ -58,11 +76,20 @@ STATIC_DISCOVERY_KEYWORDS = [
 
 NOISE_RE = re.compile(r"\b(nba|nfl|mlb|nhl|ufc|soccer|football|oscars|grammy|taylor swift|movie|album|celebrity|weather)\b", re.I)
 INVESTING_RE = re.compile(r"\b(fed|fomc|rate|inflation|cpi|pce|tariff|trump|china|taiwan|iran|israel|oil|hormuz|bitcoin|crypto|sec|etf|nvidia|tesla|openai|xai|ai|semiconductor|election|president|sanction|export control|recession|treasury|dollar|war|ceasefire)\b", re.I)
+MEME_RE = re.compile(r"\b(gta|rihanna|carti|jesus|celebrity|album|movie)\b", re.I)
 WINDOWS = [
     ("15m_shock", 15, POLYMARKET_SIGNAL_MIN_MOVE_15M),
     ("1h_shock", 60, POLYMARKET_SIGNAL_MIN_MOVE_1H),
     ("6h_shock", 360, POLYMARKET_SIGNAL_MIN_MOVE_6H),
     ("24h_shock", 1440, POLYMARKET_SIGNAL_MIN_MOVE_24H),
+]
+TOPIC_RULES = [
+    ("Rates / Fed", re.compile(r"\b(fed|fomc|rate|interest|powell|inflation|cpi|pce|jobs|recession|treasury)\b", re.I)),
+    ("Iran / Israel / Oil", re.compile(r"\b(iran|israel|ceasefire|hormuz|oil|hezbollah|uranium|enrichment|airspace|war)\b", re.I)),
+    ("China / Taiwan / Policy", re.compile(r"\b(china|taiwan|tariff|sanction|export control|trump|president|election)\b", re.I)),
+    ("Crypto", re.compile(r"\b(bitcoin|btc|ethereum|eth|crypto|sec|etf|coinbase|stablecoin)\b", re.I)),
+    ("AI / Tech", re.compile(r"\b(nvidia|nvda|tesla|tsla|openai|xai|ai|semiconductor|jensen|robotaxi|deepseek|microsoft|mistral)\b", re.I)),
+    ("Other Market Risks", INVESTING_RE),
 ]
 
 
@@ -79,6 +106,22 @@ def get_supabase() -> Client:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def execute_with_retry(label: str, operation: Callable[[], T], retries: int = 2, delay_seconds: float = 0.6) -> T:
+    last_error: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            last_error = exc
+            if attempt >= retries:
+                break
+            sleep_for = delay_seconds * (2 ** attempt)
+            logger.warning("%s failed attempt=%s retrying_in=%.1fs error=%s", label, attempt + 1, sleep_for, exc)
+            time.sleep(sleep_for)
+    assert last_error is not None
+    raise last_error
 
 
 def parse_number(value: Any) -> Optional[float]:
@@ -447,15 +490,18 @@ def discover_markets(supabase: Client) -> Dict[str, Dict[str, Any]]:
 
 
 def active_markets(supabase: Client) -> List[Dict[str, Any]]:
-    response = (
-        supabase.table("polymarket_markets")
-        .select("market_id,condition_id,slug,question,category,tags,source_url,watch_priority,discovery_score")
-        .eq("active", True)
-        .eq("closed", False)
-        .order("watch_priority", desc=True)
-        .order("discovery_score", desc=True)
-        .limit(POLYMARKET_MAX_ACTIVE_MARKETS)
-        .execute()
+    response = execute_with_retry(
+        "active_markets",
+        lambda: (
+            supabase.table("polymarket_markets")
+            .select("market_id,condition_id,slug,question,category,tags,source_url,watch_priority,discovery_score,end_date")
+            .eq("active", True)
+            .eq("closed", False)
+            .order("watch_priority", desc=True)
+            .order("discovery_score", desc=True)
+            .limit(POLYMARKET_MAX_ACTIVE_MARKETS)
+            .execute()
+        ),
     )
     return list(response.data or [])
 
@@ -502,25 +548,31 @@ def collect_snapshots(supabase: Client, discovered: Dict[str, Dict[str, Any]]) -
         snapshots.append(snapshot)
         updates.append({"market_id": row["market_id"], "last_snapshot_at": now_iso, "updated_at": now_iso})
     if snapshots:
-        supabase.table("polymarket_snapshots").insert(snapshots).execute()
+        execute_with_retry("insert_polymarket_snapshots", lambda: supabase.table("polymarket_snapshots").insert(snapshots).execute())
     for update in updates:
-        supabase.table("polymarket_markets").update({
-            "last_snapshot_at": update["last_snapshot_at"],
-            "updated_at": update["updated_at"],
-        }).eq("market_id", update["market_id"]).execute()
+        execute_with_retry(
+            f"update_polymarket_market_{update['market_id']}",
+            lambda update=update: supabase.table("polymarket_markets").update({
+                "last_snapshot_at": update["last_snapshot_at"],
+                "updated_at": update["updated_at"],
+            }).eq("market_id", update["market_id"]).execute(),
+        )
     logger.info("Inserted %s Polymarket snapshots", len(snapshots))
     return snapshots
 
 
 def previous_snapshot(supabase: Client, market_id: str, before: datetime) -> Optional[Dict[str, Any]]:
-    response = (
-        supabase.table("polymarket_snapshots")
-        .select("market_id,yes_price,volume,volume_24hr,liquidity,spread,snapshot_at")
-        .eq("market_id", market_id)
-        .lte("snapshot_at", before.isoformat())
-        .order("snapshot_at", desc=True)
-        .limit(1)
-        .execute()
+    response = execute_with_retry(
+        f"previous_snapshot_{market_id}",
+        lambda: (
+            supabase.table("polymarket_snapshots")
+            .select("market_id,yes_price,volume,volume_24hr,liquidity,spread,snapshot_at")
+            .eq("market_id", market_id)
+            .lte("snapshot_at", before.isoformat())
+            .order("snapshot_at", desc=True)
+            .limit(1)
+            .execute()
+        ),
     )
     rows = response.data or []
     return rows[0] if rows else None
@@ -646,6 +698,28 @@ def send_telegram(message: str) -> None:
     response.raise_for_status()
 
 
+def send_telegram_chunked(message: str, max_chars: int = 3800) -> int:
+    if len(message) <= max_chars:
+        send_telegram(message)
+        return 1
+    chunks: List[str] = []
+    current = ""
+    for block in message.split("\n\n"):
+        candidate = f"{current}\n\n{block}".strip() if current else block
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+        current = block
+    if current:
+        chunks.append(current)
+    for index, chunk in enumerate(chunks, start=1):
+        suffix = f"\n\nPart {index}/{len(chunks)}" if len(chunks) > 1 else ""
+        send_telegram(f"{chunk}{suffix}")
+    return len(chunks)
+
+
 def signal_message(signal: Dict[str, Any]) -> str:
     old_p = float(signal.get("old_probability") or 0)
     new_p = float(signal.get("new_probability") or 0)
@@ -655,7 +729,7 @@ def signal_message(signal: Dict[str, Any]) -> str:
     question_zh = html.escape(str(signal.get("question_zh") or ""))
     market_lines = ["<b>Market</b>：", f"EN：{question}"]
     if question_zh:
-        market_lines.append(f"中：{question_zh}")
+        market_lines.append(question_zh)
 
     return "\n".join([
         "■■■■■■■■■■■■■■■■",
@@ -688,6 +762,288 @@ def send_signals(supabase: Client, signals: List[Dict[str, Any]]) -> int:
     return sent
 
 
+def parse_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def hkt_now() -> datetime:
+    return utcnow() + timedelta(hours=8)
+
+
+def pct(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value * 100:.1f}%"
+
+
+def signed_pts(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value * 100:.1f} pts"
+
+
+def compact_money(value: Optional[float]) -> str:
+    if value is None:
+        return "N/A"
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"${value / 1_000:.0f}k"
+    return f"${value:.0f}"
+
+
+def topic_for_market(question: str, tags: Optional[List[str]] = None, category: Optional[str] = None) -> str:
+    text = " ".join([question, category or "", " ".join(tags or [])])
+    for topic, pattern in TOPIC_RULES:
+        if pattern.search(text):
+            return topic
+    return "Other Market Risks"
+
+
+def is_digest_candidate(market: Dict[str, Any], snapshot: Dict[str, Any]) -> bool:
+    question = str(market.get("question") or "")
+    if not question or MEME_RE.search(question):
+        return False
+    price = parse_number(snapshot.get("yes_price"))
+    if price is None or price <= 0 or price >= 1:
+        return False
+    volume_24hr = float(snapshot.get("volume_24hr") or snapshot.get("volume") or 0)
+    liquidity = float(snapshot.get("liquidity") or 0)
+    if volume_24hr < POLYMARKET_DIGEST_MIN_VOLUME_24H and liquidity < POLYMARKET_DIGEST_MIN_LIQUIDITY:
+        return False
+    end_date = parse_datetime(market.get("end_date"))
+    if end_date and end_date < utcnow() - timedelta(hours=12):
+        return False
+    return bool(INVESTING_RE.search(question))
+
+
+def digest_market_score(item: Dict[str, Any]) -> float:
+    snapshot = item["snapshot"]
+    price = float(snapshot.get("yes_price") or 0)
+    volume_24hr = float(snapshot.get("volume_24hr") or snapshot.get("volume") or 0)
+    liquidity = float(snapshot.get("liquidity") or 0)
+    spread = snapshot.get("spread")
+    moves = [abs(float(item.get(key) or 0)) for key in ("move_1h", "move_24h", "move_7d")]
+    move_score = min(max(moves) * 350, 45)
+    volume_score = min(math.log10(max(volume_24hr, 1)) * 7, 35)
+    liquidity_score = min(math.log10(max(liquidity, 1)) * 5, 25)
+    probability_score = 8 if 0.15 <= price <= 0.85 else 4
+    spread_penalty = 0
+    if spread is not None and float(spread) > 0.08:
+        spread_penalty = 12
+    return round(move_score + volume_score + liquidity_score + probability_score - spread_penalty, 2)
+
+
+def enrich_digest_items(supabase: Client, markets: Dict[str, Dict[str, Any]], snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    items = []
+    now = utcnow()
+    for snapshot in snapshots:
+        market_id = str(snapshot.get("market_id") or "")
+        market = markets.get(market_id)
+        if not market or not is_digest_candidate(market, snapshot):
+            continue
+        current = parse_number(snapshot.get("yes_price"))
+        if current is None:
+            continue
+        previous_values: Dict[str, Optional[float]] = {}
+        for label, minutes in [("1h", 60), ("24h", 1440), ("7d", 10080)]:
+            try:
+                previous = previous_snapshot(supabase, market_id, now - timedelta(minutes=minutes))
+            except Exception:
+                logger.warning("Digest previous snapshot skipped market_id=%s window=%s", market_id, label, exc_info=True)
+                previous = None
+            old = parse_number(previous.get("yes_price")) if previous else None
+            previous_values[label] = current - old if old is not None else None
+        question = str(market.get("question") or "")
+        item = {
+            "market": market,
+            "snapshot": snapshot,
+            "topic": topic_for_market(question, market.get("tags"), market.get("category")),
+            "move_1h": previous_values["1h"],
+            "move_24h": previous_values["24h"],
+            "move_7d": previous_values["7d"],
+        }
+        item["score"] = digest_market_score(item)
+        items.append(item)
+    return sorted(items, key=lambda item: item["score"], reverse=True)
+
+
+def choose_digest_topics(items: List[Dict[str, Any]]) -> List[Tuple[str, List[Dict[str, Any]]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for item in items:
+        grouped.setdefault(item["topic"], []).append(item)
+    topic_rows = []
+    for topic, topic_items in grouped.items():
+        selected = sorted(topic_items, key=lambda item: item["score"], reverse=True)[:POLYMARKET_DIGEST_MARKETS_PER_TOPIC]
+        score = sum(float(item["score"]) for item in selected)
+        topic_rows.append((score, topic, selected))
+    topic_rows.sort(reverse=True, key=lambda row: row[0])
+    return [(topic, selected) for _score, topic, selected in topic_rows[:POLYMARKET_DIGEST_MAX_TOPICS]]
+
+
+def translate_market_for_digest(supabase: Client, market: Dict[str, Any]) -> str:
+    existing = str(market.get("question_zh") or "").strip()
+    if existing:
+        return existing
+    question = str(market.get("question") or "")
+    translated = translate_question_zh(supabase, question)
+    if translated:
+        try:
+            supabase.table("polymarket_markets").update({"question_zh": translated, "updated_at": utcnow().isoformat()}).eq("market_id", market["market_id"]).execute()
+        except Exception:
+            logger.debug("Cannot save digest translation market_id=%s", market.get("market_id"), exc_info=True)
+        return translated
+    return ""
+
+
+def topic_fallback_takeaway(topic: str) -> str:
+    if topic == "Rates / Fed":
+        return "利率相關 odds 主要反映市場對 Fed 路徑的即時定價；若 odds 快速轉向，優先檢查美債收益率、DXY、QQQ 與 TLT 是否同步。"
+    if topic == "Iran / Israel / Oil":
+        return "地緣風險需要同時睇外交進展與升級尾部風險；若談判 odds 跌而軍事/油價 odds 升，應提高 risk-off 權重。"
+    if topic == "China / Taiwan / Policy":
+        return "政策及地緣尾部風險目前主要影響半導體、工業鏈、美元與人民幣敏感資產。"
+    if topic == "Crypto":
+        return "Crypto odds 可作短線風險偏好溫度計；留意 BTC beta 是否同 COIN、MSTR、礦股同步。"
+    if topic == "AI / Tech":
+        return "AI/Tech odds 反映市場對大型科技 catalyst 和價格區間的重新定價；重點觀察 NVDA、TSLA、QQQ 與半導體鏈。"
+    return "此 topic 有足夠流動性或 odds 變化，值得放入每日監察，但需配合新聞流和相關資產價格確認。"
+
+
+def synthesize_topic_takeaway(topic: str, items: List[Dict[str, Any]]) -> str:
+    if not POLYMARKET_DIGEST_API_KEY:
+        return topic_fallback_takeaway(topic)
+    compact_items = []
+    for item in items:
+        market = item["market"]
+        snapshot = item["snapshot"]
+        compact_items.append({
+            "question": market.get("question"),
+            "odds": snapshot.get("yes_price"),
+            "move_1h": item.get("move_1h"),
+            "move_24h": item.get("move_24h"),
+            "move_7d": item.get("move_7d"),
+            "volume_24h": snapshot.get("volume_24hr"),
+            "liquidity": snapshot.get("liquidity"),
+        })
+    try:
+        response = requests.post(
+            chat_completions_url(POLYMARKET_DIGEST_BASE_URL),
+            headers={
+                "Authorization": f"Bearer {POLYMARKET_DIGEST_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": POLYMARKET_DIGEST_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You write concise Traditional Chinese market brief takeaways for a Hong Kong investor. "
+                            "Use the supplied odds only as market-implied probabilities. Do not invent numbers. "
+                            "Return 1-2 short sentences, no bullet points, no markdown."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps({"topic": topic, "markets": compact_items}, ensure_ascii=False)},
+                ],
+                "temperature": 0.2,
+                "max_tokens": 180,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        text = str(payload["choices"][0]["message"]["content"]).strip()
+        return text or topic_fallback_takeaway(topic)
+    except Exception:
+        logger.warning("Polymarket digest synthesis failed topic=%s model=%s", topic, POLYMARKET_DIGEST_MODEL, exc_info=True)
+        return topic_fallback_takeaway(topic)
+
+
+def digest_item_lines(supabase: Client, item: Dict[str, Any]) -> List[str]:
+    market = item["market"]
+    snapshot = item["snapshot"]
+    question = html.escape(str(market.get("question") or ""))
+    question_zh = html.escape(translate_market_for_digest(supabase, market))
+    odds = pct(parse_number(snapshot.get("yes_price")))
+    move_parts = []
+    if item.get("move_1h") is not None:
+        move_parts.append(f"1h: {signed_pts(item.get('move_1h'))}")
+    if item.get("move_24h") is not None:
+        move_parts.append(f"24h: {signed_pts(item.get('move_24h'))}")
+    if item.get("move_7d") is not None:
+        move_parts.append(f"7d: {signed_pts(item.get('move_7d'))}")
+    change_text = " | ".join(move_parts[:2]) if move_parts else "change: N/A"
+    volume = compact_money(parse_number(snapshot.get("volume_24hr") or snapshot.get("volume")))
+    lines = [
+        f"• {question}",
+    ]
+    if question_zh:
+        lines.append(f"  {question_zh}")
+    lines.append(f"  Odds: {odds}（市場隱含機率） | {change_text} | 24h vol: {volume}")
+    return lines
+
+
+def build_polymarket_digest_message(supabase: Client, topics: List[Tuple[str, List[Dict[str, Any]]]]) -> str:
+    now_hkt = hkt_now()
+    lines = [
+        "■■■■■■■■■■■■■■■■",
+        "<b>POLYMARKET MARKET BRIEF</b>",
+        f"HKT {now_hkt:%Y-%m-%d %H:%M}",
+        "■■■■■■■■■■■■■■■■",
+        "",
+        "Odds = 市場隱含機率，不等於客觀真實概率。",
+    ]
+    for index, (topic, items) in enumerate(topics, start=1):
+        lines.extend(["", f"<b>{index}. {html.escape(topic)}</b>", ""])
+        for item in items:
+            lines.extend(digest_item_lines(supabase, item))
+            lines.append("")
+        lines.extend([
+            "<b>Takeaway</b>:",
+            html.escape(synthesize_topic_takeaway(topic, items)),
+        ])
+    return "\n".join(lines).strip()
+
+
+def should_send_digest(supabase: Client) -> bool:
+    if not POLYMARKET_DIGEST_ENABLED:
+        return False
+    if POLYMARKET_DIGEST_FORCE:
+        return True
+    try:
+        last_sent = parse_datetime(state_value(supabase, POLYMARKET_DIGEST_STATE_KEY))
+        return not last_sent or last_sent <= utcnow() - timedelta(hours=POLYMARKET_DIGEST_DEDUPE_HOURS)
+    except Exception:
+        logger.warning("Cannot read Polymarket digest state; allowing digest", exc_info=True)
+        return True
+
+
+def send_polymarket_digest(supabase: Client, snapshots: List[Dict[str, Any]]) -> int:
+    if not should_send_digest(supabase):
+        logger.info("Polymarket digest skipped by gate")
+        return 0
+    markets = {row["market_id"]: row for row in active_markets(supabase)}
+    items = enrich_digest_items(supabase, markets, snapshots)
+    topics = choose_digest_topics(items)
+    if not topics:
+        logger.info("Polymarket digest skipped: no qualifying topics")
+        return 0
+    message = build_polymarket_digest_message(supabase, topics)
+    chunks = send_telegram_chunked(message)
+    save_state_value(supabase, POLYMARKET_DIGEST_STATE_KEY, utcnow().isoformat())
+    logger.info("Sent Polymarket digest topics=%s items=%s chunks=%s", len(topics), sum(len(topic_items) for _topic, topic_items in topics), chunks)
+    return 1
+
+
 def cleanup(supabase: Client) -> None:
     for table, column, days in [
         ("polymarket_snapshots", "snapshot_at", POLYMARKET_SNAPSHOT_RETENTION_DAYS),
@@ -713,7 +1069,8 @@ def main() -> int:
     snapshots = collect_snapshots(supabase, discovered)
     signals = detect_signals(supabase, snapshots)
     sent = send_signals(supabase, signals)
-    logger.info("Polymarket run complete discovered=%s snapshots=%s signals=%s sent=%s", len(discovered), len(snapshots), len(signals), sent)
+    digest_sent = send_polymarket_digest(supabase, snapshots)
+    logger.info("Polymarket run complete discovered=%s snapshots=%s signals=%s sent=%s digest_sent=%s", len(discovered), len(snapshots), len(signals), sent, digest_sent)
     return 0
 
 
