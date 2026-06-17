@@ -403,7 +403,7 @@ Digest env controls:
 POLYMARKET_DIGEST_MODEL=gemini-3-flash-preview
 POLYMARKET_DIGEST_MAX_TOPICS=5
 POLYMARKET_DIGEST_MARKETS_PER_TOPIC=3
-POLYMARKET_DIGEST_DEDUPE_HOURS=12
+POLYMARKET_DIGEST_DEDUPE_HOURS=6
 ```
 
 The digest ranks topics dynamically from active markets using volume, liquidity, odds moves, topic relevance, and event recency. It should not hardcode Iran/Fed/Crypto forever; if a topic goes quiet or resolves, it should naturally fall out of the brief.

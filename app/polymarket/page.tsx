@@ -8,7 +8,6 @@ type Signal = {
   id: number;
   market_id: string;
   question: string;
-  question_zh: string | null;
   signal_type: string;
   old_probability: number | null;
   new_probability: number | null;
@@ -28,7 +27,6 @@ type Signal = {
 type Market = {
   market_id: string;
   question: string;
-  question_zh: string | null;
   category: string | null;
   tags: string[] | null;
   source: string;
@@ -70,7 +68,7 @@ async function getSignals(): Promise<Signal[]> {
   const supabase = getSupabaseServerClient();
   const { data, error } = await supabase
     .from("polymarket_signals")
-    .select("id,market_id,question,question_zh,signal_type,old_probability,new_probability,probability_change,window_minutes,volume_24hr,liquidity,spread,quality_score,market_implication_zh,trading_lens_zh,source_url,sent_to_telegram,created_at")
+    .select("id,market_id,question,signal_type,old_probability,new_probability,probability_change,window_minutes,volume_24hr,liquidity,spread,quality_score,market_implication_zh,trading_lens_zh,source_url,sent_to_telegram,created_at")
     .order("created_at", { ascending: false })
     .limit(60);
   if (error) throw new Error(error.message);
@@ -81,7 +79,7 @@ async function getMarkets(): Promise<Market[]> {
   const supabase = getSupabaseServerClient();
   const { data, error } = await supabase
     .from("polymarket_markets")
-    .select("market_id,question,question_zh,category,tags,source,discovery_score,source_url,last_snapshot_at")
+    .select("market_id,question,category,tags,source,discovery_score,source_url,last_snapshot_at")
     .eq("active", true)
     .eq("closed", false)
     .order("discovery_score", { ascending: false })
@@ -138,7 +136,6 @@ export default async function PolymarketPage() {
                   <div>
                     <p className="font-mono text-xs text-zinc-500">{hktTime(signal.created_at)} HKT · {signal.signal_type}</p>
                     <h3 className="mt-1 text-lg font-semibold leading-7 text-white">{signal.question}</h3>
-                    {signal.question_zh ? <p className="mt-1 text-sm leading-6 text-emerald-100/90">{signal.question_zh}</p> : null}
                   </div>
                   <div className={`shrink-0 border px-3 py-2 text-right font-mono ${qualityClass(signal.quality_score)}`}>
                     <p className="text-xs opacity-70">Quality</p>
@@ -166,7 +163,6 @@ export default async function PolymarketPage() {
               <article key={market.market_id} className="border border-zinc-800 bg-zinc-950/70 p-3">
                 <p className="font-mono text-xs text-zinc-500">Score {market.discovery_score} · {market.source}</p>
                 <h3 className="mt-1 text-sm font-semibold leading-6 text-white">{market.question}</h3>
-                {market.question_zh ? <p className="mt-1 text-xs leading-5 text-emerald-100/80">{market.question_zh}</p> : null}
                 <p className="mt-2 text-xs text-zinc-500">Last snapshot: {hktTime(market.last_snapshot_at)}</p>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {(market.tags ?? []).slice(0, 4).map((tag) => <span key={tag} className="border border-zinc-800 px-2 py-1 text-xs text-zinc-400">{tag}</span>)}

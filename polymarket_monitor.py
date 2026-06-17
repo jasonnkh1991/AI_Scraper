@@ -681,7 +681,16 @@ def detect_signals(supabase: Client, snapshots: List[Dict[str, Any]]) -> List[Di
         try:
             response = supabase.table("polymarket_signals").upsert(signal, on_conflict="signal_key").execute()
             inserted.extend(response.data or [signal])
-        except Exception:
+        except Exception as exc:
+            if "question_zh" in str(exc):
+                legacy_signal = dict(signal)
+                legacy_signal.pop("question_zh", None)
+                try:
+                    response = supabase.table("polymarket_signals").upsert(legacy_signal, on_conflict="signal_key").execute()
+                    inserted.extend(response.data or [signal])
+                    continue
+                except Exception:
+                    pass
             logger.warning("Signal insert failed market_id=%s", signal.get("market_id"), exc_info=True)
     logger.info("Detected %s Polymarket signals", len(inserted))
     return inserted
