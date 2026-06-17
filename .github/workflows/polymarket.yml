@@ -13,8 +13,6 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    - cron: "*/15 * * * *"
 
 concurrency:
   group: monitor-polymarket

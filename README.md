@@ -370,18 +370,20 @@ File:
 .github/workflows/polymarket.yml
 ```
 
-Current schedule:
+Current state: GitHub's built-in `schedule` trigger is intentionally disabled because scheduled GitHub Actions can be delayed. Run this workflow through cron-job.org using `workflow_dispatch`.
 
-```yaml
-schedule:
-  - cron: "*/15 * * * *"
-```
+Recommended cron-job.org jobs:
 
-GitHub cron is best-effort and can be delayed. For better punctuality, use cron-job.org to trigger `workflow_dispatch` through GitHub API.
+| Cadence | Purpose | Body input |
+| --- | --- | --- |
+| Every 15 minutes | Probability-shock detection and immediate Telegram alerts only. | `"send_digest": "false"` |
+| Every day at 08:00 HKT | Dynamic Polymarket market brief with top topics/items. | `"send_digest": "true"` |
+
+The 15-minute job should not send the daily market brief. It only snapshots active markets and sends Telegram alerts when odds cross shock thresholds.
 
 ### Polymarket Daily Market Brief
 
-The 15-minute Polymarket workflow continues to run probability-shock detection. Daily market briefs are opt-in and are intended to be triggered by an external cron service such as cron-job.org through `workflow_dispatch`.
+Daily market briefs are opt-in and are intended to be triggered by cron-job.org through `workflow_dispatch`.
 
 Dispatch inputs:
 
@@ -422,6 +424,30 @@ curl -X POST \
   -H "X-GitHub-Api-Version: 2022-11-28" \
   -H "Content-Type: application/json" \
   -d '{"ref":"main"}'
+```
+
+15-minute Polymarket shock monitor body:
+
+```json
+{
+  "ref": "main",
+  "inputs": {
+    "send_digest": "false",
+    "force_digest": "false"
+  }
+}
+```
+
+Daily 08:00 HKT Polymarket market brief body:
+
+```json
+{
+  "ref": "main",
+  "inputs": {
+    "send_digest": "true",
+    "force_digest": "false"
+  }
+}
 ```
 
 GitHub returns `204 No Content` for successful dispatch. Configure cron-job.org to treat 2xx/204 as success.
