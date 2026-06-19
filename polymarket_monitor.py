@@ -64,6 +64,9 @@ POLYMARKET_TITLE_TRANSLATION_CACHE_LIMIT = int(os.getenv("POLYMARKET_TITLE_TRANS
 DYNAMIC_WATCH_TERMS_KEY = "dynamic_watch_terms"
 TITLE_TRANSLATIONS_STATE_KEY = "polymarket_title_translations"
 POLYMARKET_DIGEST_STATE_KEY = "polymarket_digest_last_sent_at"
+POLYMARKET_SIGNAL_DEDUPE_PREFIX = "polymarket_signal_last_sent:"
+POLYMARKET_SIGNAL_DEDUPE_HOURS = int(os.getenv("POLYMARKET_SIGNAL_DEDUPE_HOURS", "6"))
+POLYMARKET_SIGNAL_REPEAT_MIN_MOVE = float(os.getenv("POLYMARKET_SIGNAL_REPEAT_MIN_MOVE", "0.15"))
 T = TypeVar("T")
 
 STATIC_DISCOVERY_KEYWORDS = [
@@ -90,6 +93,17 @@ TOPIC_RULES = [
     ("Crypto", re.compile(r"\b(bitcoin|btc|ethereum|eth|crypto|sec|etf|coinbase|stablecoin)\b", re.I)),
     ("AI / Tech", re.compile(r"\b(nvidia|nvda|tesla|tsla|openai|xai|ai|semiconductor|jensen|robotaxi|deepseek|microsoft|mistral)\b", re.I)),
     ("Other Market Risks", INVESTING_RE),
+]
+SUBTOPIC_RULES = [
+    ("Tesla / TSLA", re.compile(r"\b(tesla|tsla|robotaxi|musk)\b", re.I)),
+    ("Nvidia / Semis", re.compile(r"\b(nvidia|nvda|semiconductor|jensen|blackwell|rubin|amd|tsm|avgo)\b", re.I)),
+    ("OpenAI / xAI", re.compile(r"\b(openai|xai|chatgpt|grok|microsoft|msft|google|googl|deepseek|mistral)\b", re.I)),
+    ("Fed / Rates", re.compile(r"\b(fed|fomc|rate|powell|inflation|cpi|pce|treasury)\b", re.I)),
+    ("Iran / Israel", re.compile(r"\b(iran|israel|ceasefire|hormuz|hezbollah|uranium|enrichment)\b", re.I)),
+    ("Oil / Energy", re.compile(r"\b(oil|brent|wti|energy|opec)\b", re.I)),
+    ("China / Taiwan", re.compile(r"\b(china|taiwan|tariff|sanction|export control)\b", re.I)),
+    ("Bitcoin / BTC", re.compile(r"\b(bitcoin|btc)\b", re.I)),
+    ("Ethereum / ETH", re.compile(r"\b(ethereum|eth)\b", re.I)),
 ]
 
 
@@ -757,17 +771,118 @@ def signal_message(signal: Dict[str, Any]) -> str:
     ])
 
 
+def subtopic_for_market(question: str, tags: Optional[List[str]] = None, category: Optional[str] = None) -> str:
+    text = " ".join([question, category or "", " ".join(tags or [])])
+    for label, pattern in SUBTOPIC_RULES:
+        if pattern.search(text):
+            return label
+    words = re.findall(r"[A-Za-z0-9$]{3,}", question)
+    cleaned = [word.strip("$").title() for word in words if word.lower() not in {"will", "the", "before", "after", "market", "polymarket"}]
+    return " ".join(cleaned[:3]) if cleaned else "General"
+
+
+def signal_group_key(signal: Dict[str, Any]) -> str:
+    question = str(signal.get("question") or "")
+    topic = topic_for_market(question)
+    subtopic = subtopic_for_market(question)
+    return re.sub(r"[^a-z0-9]+", "-", f"{topic}:{subtopic}".lower()).strip("-") or "general"
+
+
+def grouped_signal_message(group_key: str, group: List[Dict[str, Any]]) -> str:
+    ordered = sorted(
+        group,
+        key=lambda row: (int(row.get("quality_score") or 0), abs(float(row.get("probability_change") or 0))),
+        reverse=True,
+    )
+    lead = ordered[0]
+    message = signal_message(lead)
+    if len(ordered) == 1:
+        return message
+
+    extra_lines = ["", "<b>Related moves consolidated</b>："]
+    for signal in ordered[1:4]:
+        old_p = float(signal.get("old_probability") or 0)
+        new_p = float(signal.get("new_probability") or 0)
+        move = float(signal.get("probability_change") or 0)
+        arrow = "▲" if move > 0 else "▼"
+        question = html.escape(str(signal.get("question") or ""))
+        extra_lines.append(f"• {question}: {old_p:.0%} → {new_p:.0%} ({arrow}{abs(move):.0%})")
+    if len(ordered) > 4:
+        extra_lines.append(f"• 另外 {len(ordered) - 4} 個相似 signal 已合併。")
+    extra_lines.append(f"Group: {html.escape(group_key)}")
+    return f"{message}\n" + "\n".join(extra_lines)
+
+
+def mark_signals_processed(supabase: Client, group: List[Dict[str, Any]]) -> None:
+    for signal in group:
+        try:
+            supabase.table("polymarket_signals").update({"sent_to_telegram": True}).eq("signal_key", signal["signal_key"]).execute()
+        except Exception:
+            logger.warning("Cannot mark Polymarket signal processed signal_key=%s", signal.get("signal_key"), exc_info=True)
+
+
+def signal_dedupe_state(supabase: Client, group_key: str) -> Dict[str, Any]:
+    try:
+        data = json.loads(state_value(supabase, f"{POLYMARKET_SIGNAL_DEDUPE_PREFIX}{group_key}") or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Cannot read Polymarket signal dedupe state group=%s", group_key, exc_info=True)
+        return {}
+
+
+def should_send_signal_group(supabase: Client, group_key: str, lead: Dict[str, Any]) -> bool:
+    state = signal_dedupe_state(supabase, group_key)
+    last_sent = parse_datetime(state.get("last_sent_at"))
+    last_probability = parse_number(state.get("new_probability"))
+    current_probability = parse_number(lead.get("new_probability"))
+    if not last_sent:
+        return True
+    if current_probability is not None and last_probability is not None:
+        if abs(current_probability - last_probability) >= POLYMARKET_SIGNAL_REPEAT_MIN_MOVE:
+            return True
+    return last_sent <= utcnow() - timedelta(hours=POLYMARKET_SIGNAL_DEDUPE_HOURS)
+
+
+def save_signal_dedupe_state(supabase: Client, group_key: str, lead: Dict[str, Any], group_size: int) -> None:
+    payload = {
+        "last_sent_at": utcnow().isoformat(),
+        "market_id": lead.get("market_id"),
+        "question": lead.get("question"),
+        "new_probability": lead.get("new_probability"),
+        "signal_type": lead.get("signal_type"),
+        "group_size": group_size,
+    }
+    try:
+        save_state_value(supabase, f"{POLYMARKET_SIGNAL_DEDUPE_PREFIX}{group_key}", json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        logger.warning("Cannot save Polymarket signal dedupe state group=%s", group_key, exc_info=True)
+
+
 def send_signals(supabase: Client, signals: List[Dict[str, Any]]) -> int:
     sent = 0
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
     for signal in signals:
-        if signal.get("sent_to_telegram"):
+        if not signal.get("sent_to_telegram"):
+            grouped.setdefault(signal_group_key(signal), []).append(signal)
+
+    for group_key, group in grouped.items():
+        ordered = sorted(
+            group,
+            key=lambda row: (int(row.get("quality_score") or 0), abs(float(row.get("probability_change") or 0))),
+            reverse=True,
+        )
+        lead = ordered[0]
+        if not should_send_signal_group(supabase, group_key, lead):
+            mark_signals_processed(supabase, group)
+            logger.info("Polymarket signal group skipped by dedupe group=%s count=%s", group_key, len(group))
             continue
         try:
-            send_telegram(signal_message(signal))
-            supabase.table("polymarket_signals").update({"sent_to_telegram": True}).eq("signal_key", signal["signal_key"]).execute()
+            send_telegram(grouped_signal_message(group_key, ordered))
+            mark_signals_processed(supabase, group)
+            save_signal_dedupe_state(supabase, group_key, lead, len(group))
             sent += 1
         except Exception:
-            logger.warning("Telegram send failed for Polymarket signal", exc_info=True)
+            logger.warning("Telegram send failed for Polymarket signal group=%s", group_key, exc_info=True)
     return sent
 
 
@@ -890,12 +1005,66 @@ def choose_digest_topics(items: List[Dict[str, Any]]) -> List[Tuple[str, List[Di
     for item in items:
         grouped.setdefault(item["topic"], []).append(item)
     topic_rows = []
+    natural_topic_count = len(grouped)
+    markets_per_topic = POLYMARKET_DIGEST_MARKETS_PER_TOPIC if natural_topic_count >= POLYMARKET_DIGEST_MAX_TOPICS else 1
     for topic, topic_items in grouped.items():
-        selected = sorted(topic_items, key=lambda item: item["score"], reverse=True)[:POLYMARKET_DIGEST_MARKETS_PER_TOPIC]
+        selected = sorted(topic_items, key=lambda item: item["score"], reverse=True)[:markets_per_topic]
         score = sum(float(item["score"]) for item in selected)
         topic_rows.append((score, topic, selected))
     topic_rows.sort(reverse=True, key=lambda row: row[0])
-    return [(topic, selected) for _score, topic, selected in topic_rows[:POLYMARKET_DIGEST_MAX_TOPICS]]
+
+    output: List[Tuple[str, List[Dict[str, Any]]]] = []
+    used_market_ids: set[str] = set()
+    for _score, topic, selected in topic_rows[:POLYMARKET_DIGEST_MAX_TOPICS]:
+        output.append((topic, selected))
+        for item in selected:
+            used_market_ids.add(str(item["market"].get("market_id") or ""))
+
+    if len(output) >= POLYMARKET_DIGEST_MAX_TOPICS:
+        return output
+
+    focus_rows: List[Tuple[float, str, Dict[str, Any]]] = []
+    for item in items:
+        market = item["market"]
+        market_id = str(market.get("market_id") or "")
+        if market_id in used_market_ids:
+            continue
+        question = str(market.get("question") or "")
+        label = f"{item['topic']} Focus: {subtopic_for_market(question, market.get('tags'), market.get('category'))}"
+        focus_rows.append((float(item["score"]), label, item))
+
+    seen_labels = {topic for topic, _items in output}
+    for _score, label, item in sorted(focus_rows, reverse=True, key=lambda row: row[0]):
+        if len(output) >= POLYMARKET_DIGEST_MAX_TOPICS:
+            break
+        suffix = ""
+        unique_label = label
+        counter = 2
+        while unique_label in seen_labels:
+            suffix = f" #{counter}"
+            unique_label = f"{label}{suffix}"
+            counter += 1
+        seen_labels.add(unique_label)
+        used_market_ids.add(str(item["market"].get("market_id") or ""))
+        output.append((unique_label, [item]))
+
+    if len(output) >= POLYMARKET_DIGEST_MAX_TOPICS:
+        return output
+
+    for item in items:
+        market_id = str(item["market"].get("market_id") or "")
+        if market_id in used_market_ids:
+            continue
+        question = str(item["market"].get("question") or "")
+        label = f"Market Focus: {subtopic_for_market(question, item['market'].get('tags'), item['market'].get('category'))}"
+        if label in seen_labels:
+            label = f"{label} #{len(output) + 1}"
+        output.append((label, [item]))
+        used_market_ids.add(market_id)
+        if len(output) >= POLYMARKET_DIGEST_MAX_TOPICS:
+            break
+
+    return output
 
 
 def translate_market_for_digest(supabase: Client, market: Dict[str, Any]) -> str:

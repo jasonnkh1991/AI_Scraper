@@ -381,6 +381,8 @@ Recommended cron-job.org jobs:
 
 The 15-minute job should not send the daily market brief. It only snapshots active markets and sends Telegram alerts when odds cross shock thresholds.
 
+Immediate Polymarket alerts are consolidated before Telegram delivery. Similar signals, for example multiple Tesla/TSLA/robotaxi probability shocks in the same run, are grouped into one Telegram message. The same group is also cooled down across runs so repeated alerts do not spam Telegram unless the odds move materially again.
+
 ### Polymarket Daily Market Brief
 
 Daily market briefs are opt-in and are intended to be triggered by cron-job.org through `workflow_dispatch`.
@@ -408,7 +410,16 @@ POLYMARKET_DIGEST_MARKETS_PER_TOPIC=3
 POLYMARKET_DIGEST_DEDUPE_HOURS=6
 ```
 
-The digest ranks topics dynamically from active markets using volume, liquidity, odds moves, topic relevance, and event recency. It should not hardcode Iran/Fed/Crypto forever; if a topic goes quiet or resolves, it should naturally fall out of the brief.
+The digest ranks topics dynamically from active markets using volume, liquidity, odds moves, topic relevance, and event recency. It targets five sections. If the market only has two or three broad themes on a given morning, the digest splits high-scoring names inside those themes into focused sections such as `AI / Tech Focus: Tesla / TSLA`, instead of sending only two big topics. It should not hardcode Iran/Fed/Crypto forever; if a topic goes quiet or resolves, it should naturally fall out of the brief.
+
+Immediate Polymarket alert noise controls:
+
+```text
+POLYMARKET_SIGNAL_DEDUPE_HOURS=6
+POLYMARKET_SIGNAL_REPEAT_MIN_MOVE=0.15
+```
+
+`POLYMARKET_SIGNAL_DEDUPE_HOURS` suppresses repeated Telegram messages from the same topic/entity group. `POLYMARKET_SIGNAL_REPEAT_MIN_MOVE` allows a new Telegram message inside the cooldown window only when the implied probability has moved materially again.
 
 ## External Cron Option
 

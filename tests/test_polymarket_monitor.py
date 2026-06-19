@@ -75,8 +75,10 @@ class PolymarketMonitorTests(unittest.TestCase):
         ))
 
     def test_choose_digest_topics_limits_markets_per_topic(self):
+        original_max = pm.POLYMARKET_DIGEST_MAX_TOPICS
         original_limit = pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC
         try:
+            pm.POLYMARKET_DIGEST_MAX_TOPICS = 1
             pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC = 2
             items = [
                 {"topic": "Rates / Fed", "score": 50, "market": {}, "snapshot": {}},
@@ -87,7 +89,38 @@ class PolymarketMonitorTests(unittest.TestCase):
             self.assertEqual(len(topics), 1)
             self.assertEqual(len(topics[0][1]), 2)
         finally:
+            pm.POLYMARKET_DIGEST_MAX_TOPICS = original_max
             pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC = original_limit
+
+    def test_choose_digest_topics_expands_focus_topics_when_broad_topics_are_sparse(self):
+        original_max = pm.POLYMARKET_DIGEST_MAX_TOPICS
+        original_limit = pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC
+        try:
+            pm.POLYMARKET_DIGEST_MAX_TOPICS = 5
+            pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC = 3
+            items = [
+                {"topic": "AI / Tech", "score": 90, "market": {"market_id": "1", "question": "Will Tesla launch robotaxi?"}, "snapshot": {}},
+                {"topic": "AI / Tech", "score": 85, "market": {"market_id": "2", "question": "Will Nvidia hit $200?"}, "snapshot": {}},
+                {"topic": "AI / Tech", "score": 80, "market": {"market_id": "3", "question": "Will OpenAI release GPT?"}, "snapshot": {}},
+                {"topic": "Crypto", "score": 75, "market": {"market_id": "4", "question": "Will Bitcoin hit $120k?"}, "snapshot": {}},
+                {"topic": "Crypto", "score": 70, "market": {"market_id": "5", "question": "Will Ethereum ETF inflows rise?"}, "snapshot": {}},
+                {"topic": "Crypto", "score": 65, "market": {"market_id": "6", "question": "Will Coinbase hit $400?"}, "snapshot": {}},
+            ]
+            topics = pm.choose_digest_topics(items)
+            self.assertEqual(len(topics), 5)
+            self.assertTrue(any("Focus" in topic for topic, _items in topics))
+            self.assertEqual(len({topic for topic, _items in topics}), 5)
+        finally:
+            pm.POLYMARKET_DIGEST_MAX_TOPICS = original_max
+            pm.POLYMARKET_DIGEST_MARKETS_PER_TOPIC = original_limit
+
+    def test_signal_group_key_consolidates_tesla_variants(self):
+        keys = {
+            pm.signal_group_key({"question": "Will Tesla robotaxi launch before July?"}),
+            pm.signal_group_key({"question": "Will TSLA close above $350 after robotaxi event?"}),
+            pm.signal_group_key({"question": "Will Elon Musk announce a Tesla product this month?"}),
+        }
+        self.assertEqual(len(keys), 1)
 
     def test_digest_message_explains_odds_and_omits_chinese_label(self):
         message = pm.build_polymarket_digest_message(None, [(
