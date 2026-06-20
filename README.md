@@ -128,6 +128,8 @@ APIFY_ACTOR_ID=pzMmk1t7AZ8OKJhfU
 
 This uses Twitter advanced search queries instead of a single X List URL. It was chosen because previous list scraping was more expensive and less predictable.
 
+Truth Social crawling is disabled by default. The production monitor should only fetch X.com unless `TRUTH_SOCIAL_ENABLED=true` is explicitly passed for a diagnostic or temporary manual run.
+
 ### Queue Processing
 
 The crawler does not assume every fetched tweet can be processed immediately.

@@ -24,6 +24,7 @@ def ny_time(hour: int, minute: int) -> datetime:
 class TruthSocialTest(unittest.TestCase):
     def tearDown(self) -> None:
         os.environ.pop("BYPASS_MARKET_WINDOW", None)
+        crawler.TRUTH_SOCIAL_ENABLED = False
 
     def test_normalize_truth_post(self) -> None:
         post = crawler.normalize_truth_post({
@@ -43,7 +44,12 @@ class TruthSocialTest(unittest.TestCase):
         self.assertEqual(post["author_handle"], "truth:realDonaldTrump")
         self.assertEqual(post["tweet_text"], "Tariffs are coming & China knows it.")
 
-    def test_truth_social_runs_hourly_by_default(self) -> None:
+    def test_truth_social_is_disabled_by_default(self) -> None:
+        crawler.TRUTH_SOCIAL_ENABLED = False
+        self.assertFalse(crawler.should_run_truth_social(ny_time(9, 7)))
+
+    def test_truth_social_runs_hourly_when_explicitly_enabled(self) -> None:
+        crawler.TRUTH_SOCIAL_ENABLED = True
         self.assertTrue(crawler.should_run_truth_social(ny_time(9, 7)))
         self.assertFalse(crawler.should_run_truth_social(ny_time(9, 22)))
         self.assertFalse(crawler.should_run_truth_social(ny_time(2, 7)))
